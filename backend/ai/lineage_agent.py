@@ -528,7 +528,7 @@ def _format_tools_for_prompt() -> str:
             parts.append("</parameter>")
 
         parts.append("</parameters>")
-        parts.append("</function>")d
+        parts.append("</function>")
 
     parts.append("</tools>")
     parts.extend([
