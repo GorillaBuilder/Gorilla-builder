@@ -824,12 +824,20 @@ let analyticsChart1 = null, analyticsChart2 = null;
 
 // ── SSE STATE MACHINE ─────────────────────────────────────────────────────
 // Single source of truth. Never create EventSource anywhere else.
+//
+// Reliability model:
+//  - Every server event carries an SSE `id:` (per-project sequence number).
+//  - We remember the last id we saw; every reconnect passes it back as
+//    ?last_id=… and the server replays everything missed (buffered ~10 min).
+//  - So edge resets / brief drops no longer lose messages.
 let _es = null;
 let _esState = 'closed'; // 'closed' | 'connecting' | 'open'
 let _esReconnectTimer = null;
-let _esReconnectDelay = 1000; // starts at 1s, backs off to 30s
-const _esMaxDelay = 30000;
-let _esOpenCallbacks = []; // resolved once per open event
+let _esReconnectDelay = 1000;  // 1s → capped at 8s: fast recovery matters more
+const _esMaxDelay = 8000;      // than politeness for a single-user stream
+let _esOpenCallbacks = [];     // resolved once per open event
+let _esLastEventId = null;     // resume cursor (server sequence id)
+let _esFailStreak = 0;         // consecutive failures → run auth probe
 
 const $ = id => document.getElementById(id);
 const chat = $("chat");
@@ -868,11 +876,15 @@ function _openStream() {
   _esState = 'connecting';
   setConn('warn');
 
-  _es = new EventSource(`/api/project/${PROJECT_ID}/events`);
+  // Pass the resume cursor so the server replays anything we missed.
+  let url = `/api/project/${PROJECT_ID}/events`;
+  if (_esLastEventId !== null) url += `?last_id=${encodeURIComponent(_esLastEventId)}`;
+  _es = new EventSource(url);
 
   _es.onopen = () => {
     _esState = 'open';
     _esReconnectDelay = 1000; // reset backoff on success
+    _esFailStreak = 0;
     setConn('ok');
     // Resolve all waiting callers
     const cbs = _esOpenCallbacks.splice(0);
@@ -882,8 +894,23 @@ function _openStream() {
   _es.onerror = () => {
     _esState = 'closed';
     setConn('bad');
-    _es.close(); _es = null;
-    // Schedule reconnect with exponential backoff
+    if (_es) { _es.close(); _es = null; }
+    _esFailStreak++;
+
+    // EventSource can't tell us WHY it failed. After 3 straight failures,
+    // probe an authed endpoint: if the session died (server 401s), stop
+    // reconnect-looping and send the user to login.
+    if (_esFailStreak === 3) {
+      fetch(`/api/project/${PROJECT_ID}/tokens`)
+        .then(r => {
+          if (r.status === 401 || r.status === 403 || r.redirected) {
+            window.location.href = '/login';
+          }
+        })
+        .catch(() => {});
+    }
+
+    // Schedule reconnect with exponential backoff (capped)
     _esReconnectTimer = setTimeout(() => {
       _esReconnectDelay = Math.min(_esReconnectDelay * 2, _esMaxDelay);
       _openStream();
@@ -891,6 +918,7 @@ function _openStream() {
   };
 
   _es.onmessage = (e) => {
+    if (e.lastEventId) _esLastEventId = e.lastEventId; // advance resume cursor
     try { _handleSSEMessage(JSON.parse(e.data)); }
     catch(err) { console.warn('SSE parse error', err); }
   };
@@ -911,6 +939,7 @@ function _streamOpenOrTimeout(timeoutMs = 8000) {
 // All SSE events go through here — no duplicate handlers anywhere.
 // ─────────────────────────────────────────────────────────────────────────
 async function _handleSSEMessage(m) {
+  if (m.type === "sse_open") return; // connection handshake — not UI state
   if (m.type === "auth_error") {
     // Server-sent auth failure — redirect cleanly instead of spinning
     window.location.href = '/login';
@@ -1476,7 +1505,8 @@ function switchTab(tab) {
       $("preview").src = sandboxUrl; $("preview").style.display = "block";
     } else {
       $("previewEmpty").style.display = "flex";
-      bootSandboxIfNeeded();
+      // The agent boots (and owns) the sandbox during a run — don't race it.
+      if (!window.isAgentWorking) bootSandboxIfNeeded();
     }
   } else if (tab === "analytics") {
     $("tabAnalytics").classList.add("active");
@@ -1892,7 +1922,11 @@ async function loadAnalytics() {
   loadChatHistory();
   await refreshFiles();
   try { await loadFile(currentFile); } catch(e) {}
-  switchTab("preview");
+  // Land on Code — do NOT auto-open Preview here. Opening Preview with no
+  // live sandbox triggered bootSandboxIfNeeded() on every page load, which
+  // is the "sandbox starts out of nowhere" bug. Sandboxes now boot only
+  // when the user clicks Preview, or when the agent boots one itself.
+  switchTab("code");
 
   if (INITIAL_PROMPT) {
     // For initial prompt: open SSE first, then trigger agent after it's confirmed open.

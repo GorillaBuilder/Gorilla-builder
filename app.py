@@ -14,6 +14,7 @@ import re
 import urllib.parse
 import subprocess
 import tempfile
+import hashlib
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Set
 
@@ -134,6 +135,17 @@ _AGENT_PAUSE_EVENTS: Dict[str, asyncio.Event] = {}
 _AGENT_PAUSE_DATA:   Dict[str, Any]           = {}
 _sandbox_manager = None  # ← ADD THIS LINE
 
+# Serializes concurrent boot attempts per project (frontend tab-click racing
+# the agent's own ensure_running was occasionally double-creating sandboxes).
+_SANDBOX_BOOT_LOCKS: Dict[str, asyncio.Lock] = {}
+
+def _sandbox_boot_lock(project_id: str) -> asyncio.Lock:
+    lock = _SANDBOX_BOOT_LOCKS.get(project_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SANDBOX_BOOT_LOCKS[project_id] = lock
+    return lock
+
 # ==========================================================================
 # APP INITIALIZATION & LIFECYCLE
 # ==========================================================================
@@ -146,9 +158,21 @@ app = FastAPI(
     openapi_url="/api/openapi.json" # <--- MOVES the JSON schema
 )
 
+# Session secret MUST be stable across restarts/deploys, or every deploy logs
+# everyone out and the SSE route starts 403→redirect looping for old cookies.
+# Prefer AUTH_SECRET_KEY; fall back to a deterministic derivation so a missing
+# env var degrades gracefully instead of randomly.
+_auth_secret = os.getenv("AUTH_SECRET_KEY")
+if not _auth_secret:
+    _auth_secret = hashlib.sha256(
+        f"gorilla-session-v1::{SUPABASE_KEY}".encode()
+    ).hexdigest()
+    print("⚠️ AUTH_SECRET_KEY not set — using a derived stable fallback. "
+          "Set AUTH_SECRET_KEY in Koyeb env vars for production.")
+
 app.add_middleware(
     SessionMiddleware,
-    secret_key=os.getenv("AUTH_SECRET_KEY", secrets.token_hex(32)),
+    secret_key=_auth_secret,
 )
 
 app.add_middleware(
@@ -2143,36 +2167,39 @@ async def start_sandbox(request: Request, project_id: str):
     if not _sandbox_manager:
         return JSONResponse({"detail": "Sandbox manager not initialized"}, status_code=503)
 
-    if _sandbox_manager.is_running(project_id):
-        url = _sandbox_manager.get_preview_url(project_id)
-        if url:
-            progress_bus.emit(project_id, {"type": "sandbox_url", "url": url})
-        return JSONResponse({"status": "running", "url": url or ""})
- 
-    try:
-        enforce_token_limit_or_raise(user["id"])
-    except HTTPException as e:
-        if e.status_code == 402:
-            emit_log(project_id, "assistant", (
-                "⚠️ **Your token limit has been reached.** The sandbox can't start until you upgrade or top up. "
-                "Visit [Pricing](/pricing) to continue building."
-            ))
-            return JSONResponse({
-                "detail": "Token limit reached. Please upgrade your plan or top up tokens to continue.",
-                "upgrade_url": "/pricing"
-            }, status_code=402)
-        raise
+    # Serialize boots per project — a second concurrent request waits here,
+    # then sees is_running() == True and returns the same sandbox.
+    async with _sandbox_boot_lock(project_id):
+        if _sandbox_manager.is_running(project_id):
+            url = _sandbox_manager.get_preview_url(project_id)
+            if url:
+                progress_bus.emit(project_id, {"type": "sandbox_url", "url": url})
+            return JSONResponse({"status": "running", "url": url or ""})
 
- 
-    env_vars = _build_sandbox_env(project_id, user["id"])
-    try:
-        await _sandbox_manager.ensure_running(project_id, env_vars, user["id"])
-        url = await _sandbox_manager.start_dev_server(project_id)
-        track_event(project_id, "sandbox_boot")
-        return JSONResponse({"status": "ok", "url": url or ""})
-    except Exception as e:
-        print(f"Sandbox boot error: {e}")
-        return JSONResponse({"detail": str(e)}, status_code=500)
+        try:
+            # Sync Supabase call — off the event loop so SSE keeps flowing.
+            await asyncio.to_thread(enforce_token_limit_or_raise, user["id"])
+        except HTTPException as e:
+            if e.status_code == 402:
+                emit_log(project_id, "assistant", (
+                    "⚠️ **Your token limit has been reached.** The sandbox can't start until you upgrade or top up. "
+                    "Visit [Pricing](/pricing) to continue building."
+                ))
+                return JSONResponse({
+                    "detail": "Token limit reached. Please upgrade your plan or top up tokens to continue.",
+                    "upgrade_url": "/pricing"
+                }, status_code=402)
+            raise
+
+        env_vars = await asyncio.to_thread(_build_sandbox_env, project_id, user["id"])
+        try:
+            await _sandbox_manager.ensure_running(project_id, env_vars, user["id"])
+            url = await _sandbox_manager.start_dev_server(project_id)
+            await asyncio.to_thread(track_event, project_id, "sandbox_boot")
+            return JSONResponse({"status": "ok", "url": url or ""})
+        except Exception as e:
+            print(f"Sandbox boot error: {e}")
+            return JSONResponse({"detail": str(e)}, status_code=500)
  
  
 @app.post("/api/project/{project_id}/sandbox/stop")
@@ -2297,10 +2324,11 @@ async def run_agent_loop(
         await asyncio.sleep(0.2)
 
         # ---- Load project state ----
-        proj = db_select_one(
+        proj = (await asyncio.to_thread(
+            db_select_one,
             "projects", {"id": project_id},
             "name, chat_history, supabase_project_ref, gorilla_auth_id",
-        ) or {}
+        )) or {}
         project_name = proj.get("name", "Gorilla App")
         project_ref = proj.get("supabase_project_ref")
         has_supabase = bool(project_ref)  # ← add this line here
@@ -2322,10 +2350,11 @@ async def run_agent_loop(
                 ).eq("id", project_id).execute()
             )
 
-        user_data = db_select_one(
+        user_data = (await asyncio.to_thread(
+            db_select_one,
             "users", {"id": user_id},
             "gorilla_api_key, supabase_access_token, agent_skills",
-        ) or {}
+        )) or {}
         supa_token = user_data.get("supabase_access_token")
         agent_skills = user_data.get("agent_skills")  # ← add this line
         is_db_request = (agent_type == "supabase")
@@ -2415,7 +2444,7 @@ async def run_agent_loop(
                 emit_log(project_id, "system", f"DB provisioning error: {e}")
 
         # ---- Build env + contextual prompt ----
-        env_vars = _build_sandbox_env(project_id, user_id)
+        env_vars = await asyncio.to_thread(_build_sandbox_env, project_id, user_id)
         gorilla_proxy = os.getenv("FILE_API_BASE_URL", "https://your-proxy.ngrok-free.dev")
 
         contextual_prompt = prompt
@@ -2473,10 +2502,12 @@ async def run_agent_loop(
         # Charge tokens immediately after the turn completes
         total_tokens = result.get("tokens", 0)
         if total_tokens and user_id:
-            add_monthly_tokens(user_id, total_tokens)
-            _maybe_emit_token_warning(project_id, user_id)
+            # Sync DB writes — keep them off the event loop so SSE never stalls.
+            await asyncio.to_thread(add_monthly_tokens, user_id, total_tokens)
+            await asyncio.to_thread(_maybe_emit_token_warning, project_id, user_id)
 
-        track_event(project_id, "agent_run", metadata={"tokens": total_tokens})
+        await asyncio.to_thread(track_event, project_id, "agent_run",
+                                metadata={"tokens": total_tokens})
 
         # Process user action (pause/resume flow)
         user_action = result.get("user_action")
@@ -2991,7 +3022,7 @@ async def app_auth_github_callback(request: Request, code: str, state: str):
             "https://github.com/login/oauth/access_token", 
             data={
                 "client_id": GITHUB_APPAUTH_CLIENT_ID,
-                "client_secret": GITHUB_APP_AUTH_CLIENT_SECRET,
+                "client_secret": GITHUB_APPAUTH_CLIENT_SECRET,
                 "code": code,
                 "redirect_uri": f"{site_url}/api/v1/app-auth/github/callback"
             },
@@ -3298,7 +3329,7 @@ async def generate_design_endpoint(request: Request, design_id: str, background_
     """
     user = get_current_user(request)
     try:
-        enforce_token_limit_or_raise(user["id"])
+        await asyncio.to_thread(enforce_token_limit_or_raise, user["id"])
     except HTTPException as e:
         if e.status_code == 402:
             raise HTTPException(402, "Token limit reached")
@@ -3402,7 +3433,7 @@ async def edit_design_endpoint(request: Request, design_id: str):
     """
     user = get_current_user(request)
     try:
-        enforce_token_limit_or_raise(user["id"])
+        await asyncio.to_thread(enforce_token_limit_or_raise, user["id"])
     except HTTPException as e:
         if e.status_code == 402:
             raise HTTPException(402, "Token limit reached")
@@ -3898,57 +3929,106 @@ async def serve_project_file(request: Request, project_id: str, path: str):
 import json
 
 class _ProgressBus:
-    """Progress bus with a short replay buffer so new SSE subscribers catch
-    up on events that fired in the last few seconds. Fixes the race where
-    the backend starts emitting before the frontend (re)connects its SSE."""
- 
-    REPLAY_WINDOW_S = 8.0       # replay events from last 8 seconds
-    BUFFER_CAP      = 200       # per-project cap
- 
+    """Sequenced, replayable, thread-safe event bus.
+
+    Fixes two production failure modes:
+
+    1. LOST EVENTS ON RECONNECT — every event gets a monotonically increasing
+       sequence id. Reconnecting SSE clients send back the last id they saw
+       (?last_id=N) and we replay everything after it from a 10-minute buffer.
+       Brand-new subscribers (no last_id) replay only the last RECENT_WINDOW_S
+       seconds, which closes the connect-vs-first-emit race on cold loads
+       without duplicating old history.
+
+    2. CROSS-THREAD CORRUPTION — the E2B sandbox manager and to_thread-offloaded
+       DB code call emit_* from WORKER THREADS. asyncio.Queue is not thread-safe;
+       put_nowait from the wrong thread can silently drop events or lose waiter
+       wakeups. We bind the main loop at startup and marshal cross-thread emits
+       with call_soon_threadsafe.
+
+    Still in-memory ⇒ SINGLE PROCESS ONLY. Run exactly one uvicorn worker and
+    pin Koyeb to one instance (scale min = max = 1). Multi-instance needs Redis
+    pub/sub instead.
+    """
+
+    RECENT_WINDOW_S = 15.0     # replay window for brand-new subscribers
+    BUFFER_TTL_S    = 600.0    # how far back a reconnecting client can resume
+    BUFFER_CAP      = 500      # per-project buffered events
+
     def __init__(self):
         self._queues: Dict[str, List[asyncio.Queue]] = {}
-        # project_id -> list of (timestamp, event_dict)
-        self._buffer: Dict[str, List[tuple]] = {}
- 
-    def subscribe(self, project_id: str) -> asyncio.Queue:
-        q = asyncio.Queue()
+        self._buffer: Dict[str, List[tuple]] = {}   # (seq, ts, event)
+        # Seed from wall clock so ids stay monotonic across restarts — a client
+        # resuming with a pre-restart id can never mask post-restart events.
+        self._next_seq: int = int(time.time() * 1000)
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Call once at startup with the main event loop."""
+        self._loop = loop
+
+    def subscribe(self, project_id: str, last_id: Optional[int] = None) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
         self._queues.setdefault(project_id, []).append(q)
- 
-        # Replay recent events so the new subscriber doesn\'t miss anything
+
         now = time.time()
-        recent = [
-            (ts, ev) for (ts, ev) in self._buffer.get(project_id, [])
-            if (now - ts) <= self.REPLAY_WINDOW_S
-        ]
-        for _, ev in recent:
+        buf = self._buffer.get(project_id, [])
+        if last_id is not None:
+            # Reconnect: replay everything the client missed.
+            replay = [(s, ev) for (s, ts, ev) in buf if s > last_id]
+        else:
+            # Fresh connect: only very recent events (race-closing, no dupes).
+            replay = [(s, ev) for (s, ts, ev) in buf
+                      if (now - ts) <= self.RECENT_WINDOW_S]
+        for item in replay:
             try:
-                q.put_nowait(ev)
+                q.put_nowait(item)
             except Exception:
                 pass
         return q
- 
+
     def unsubscribe(self, project_id: str, q: asyncio.Queue) -> None:
-        if project_id in self._queues and q in self._queues[project_id]:
-            self._queues[project_id].remove(q)
- 
+        subs = self._queues.get(project_id)
+        if subs and q in subs:
+            subs.remove(q)
+        if subs is not None and not subs:
+            self._queues.pop(project_id, None)
+
     def emit(self, project_id: str, event: Dict[str, Any]) -> None:
-        # Push to all live subscribers
-        for q in self._queues.get(project_id, []):
-            try: q.put_nowait(event)
-            except Exception: pass
- 
-        # Also buffer for late subscribers
+        self._next_seq += 1
+        seq = self._next_seq
+        item = (seq, event)
+
+        # Buffer immediately (list append is fine under the GIL).
         buf = self._buffer.setdefault(project_id, [])
-        buf.append((time.time(), event))
- 
-        # Trim the buffer by size
+        buf.append((seq, time.time(), event))
         if len(buf) > self.BUFFER_CAP:
             del buf[: len(buf) - self.BUFFER_CAP]
- 
-        # Also trim by age (cheap, runs every emit)
-        cutoff = time.time() - self.REPLAY_WINDOW_S
-        while buf and buf[0][0] < cutoff:
+        cutoff = time.time() - self.BUFFER_TTL_S
+        while buf and buf[0][1] < cutoff:
             buf.pop(0)
+
+        def _deliver():
+            for q in list(self._queues.get(project_id, [])):
+                try:
+                    q.put_nowait(item)
+                except Exception:
+                    pass
+
+        # Deliver on the MAIN loop, always. If we're on a worker thread
+        # (sandbox-manager callbacks, asyncio.to_thread DB code), marshal
+        # over safely instead of poking asyncio.Queue cross-thread.
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+
+        if running is not None and (self._loop is None or running is self._loop):
+            _deliver()
+        elif self._loop is not None:
+            self._loop.call_soon_threadsafe(_deliver)
+        else:
+            _deliver()  # startup edge case: no loop bound yet
 
 progress_bus = _ProgressBus()
 
@@ -4046,10 +4126,9 @@ async def _fetch_file_tree(project_id: str) -> Dict[str, str]:
     """
     try:
         query = supabase.table("files").select("path,content").eq("project_id", project_id)
-        res = query.execute()
-        
-        if asyncio.iscoroutine(res):
-            res = await res
+        # Sync HTTP call — off-load so it can't freeze SSE/keep-alives while
+        # pulling a large file tree.
+        res = await asyncio.to_thread(query.execute)
             
         rows = getattr(res, "data", [])
         if not rows and isinstance(res, list):
@@ -4079,7 +4158,7 @@ async def agent_start(request: Request, project_id: str):
     _require_project_owner(user, project_id)
  
     try:
-        enforce_token_limit_or_raise(user["id"])
+        await asyncio.to_thread(enforce_token_limit_or_raise, user["id"])
     except HTTPException as e:
         if e.status_code == 402:
             emit_log(project_id, "assistant", _render_token_limit_message())
@@ -4199,32 +4278,51 @@ async def agent_resume(request: Request, project_id: str):
 @app.get("/api/project/{project_id}/events")
 async def agent_events(request: Request, project_id: str):
     if not DEV_MODE:
-        user = get_current_user(request)
-        _require_project_owner(user, project_id)
+        try:
+            user = get_current_user(request)
+            _require_project_owner(user, project_id)
+        except HTTPException:
+            # Return a PLAIN 401 — never the 303 redirect. EventSource can't
+            # follow redirects to HTML; it just error-loops with no signal.
+            # The frontend auth probe detects this 401 and sends the user
+            # to /login instead of retrying forever.
+            return Response(status_code=401, media_type="text/plain",
+                            content="unauthorized")
+
+    # Resume cursor: our client passes ?last_id on manual reconnects; native
+    # EventSource auto-reconnect sends the Last-Event-ID header. Honor both.
+    last_id: Optional[int] = None
+    raw_last = request.query_params.get("last_id") or request.headers.get("last-event-id")
+    if raw_last:
+        try:
+            last_id = int(raw_last)
+        except (TypeError, ValueError):
+            last_id = None
 
     async def _gen():
-        q = progress_bus.subscribe(project_id)
+        q = progress_bus.subscribe(project_id, last_id=last_id)
         try:
-            yield ":" + " " * 4096 + "\n\n"   # prime the proxy, force first flush
-            yield f"data: {json.dumps({'type':'status','text':'Connected'})}\n\n"
+            yield ":" + " " * 2048 + "\n\n"       # prime proxy buffers, force flush
+            yield "retry: 2000\n\n"
+            yield f"data: {json.dumps({'type': 'sse_open'})}\n\n"
             while True:
                 try:
-                    ev = await asyncio.wait_for(q.get(), timeout=15)
-                    yield f"data: {json.dumps(ev)}\n\n"
+                    seq, ev = await asyncio.wait_for(q.get(), timeout=10)
+                    yield f"id: {seq}\ndata: {json.dumps(ev)}\n\n"
                 except asyncio.TimeoutError:
-                    yield ": keep-alive\n\n"
+                    yield ": ka\n\n"              # heartbeat every 10s
         finally:
             progress_bus.unsubscribe(project_id, q)
 
-    from fastapi.responses import StreamingResponse
     return StreamingResponse(
-        _gen(), 
+        _gen(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache", 
-            "Connection": "keep-alive", 
-            "X-Accel-Buffering": "no"
-        }
+            # no-transform tells intermediaries not to buffer/compress the stream
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 from fastapi.responses import HTMLResponse
@@ -4622,6 +4720,8 @@ async def proxy_chat_completions_bargain(request: Request, auth=Depends(verify_g
 
 @app.on_event("startup")
 async def start_background_tasks():
+    # Bind the main loop so worker-thread emits can be marshalled safely.
+    progress_bus.bind_loop(asyncio.get_running_loop())
     asyncio.create_task(_cleanup_expired_otps())
  
 async def _cleanup_expired_otps():
