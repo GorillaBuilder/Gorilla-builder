@@ -1926,7 +1926,7 @@ async function loadAnalytics() {
   // live sandbox triggered bootSandboxIfNeeded() on every page load, which
   // is the "sandbox starts out of nowhere" bug. Sandboxes now boot only
   // when the user clicks Preview, or when the agent boots one itself.
-  switchTab("code");
+  switchTab("preview");
 
   if (INITIAL_PROMPT) {
     // For initial prompt: open SSE first, then trigger agent after it's confirmed open.
