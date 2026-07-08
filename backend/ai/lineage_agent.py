@@ -802,8 +802,8 @@ Final turn — `run_bash` to start dev + verify both ports 200, then `mark_done`
 import { login, logout, onAuthStateChanged } from '@/utils/auth';
 useEffect(() => onAuthStateChanged(setUser), []);
 <button onClick={() => login()}>Sign in</button>
-
 ```
+Remeber to call it back.
 
 # AI proxy
 
@@ -1022,6 +1022,13 @@ Built the dashboard with Navbar, three pages, and the items API. Both servers he
 
 
 </tool_call>
+
+IMPORTANT POINTS:
+
+TRY NOT TO RESTART SERVERS AND INSTEAD DIAGNOSE YOUR CODE FOR ISSUES FIRST.
+BE FULLY SURE THAT ISSUES ARE SOLVED ONCE YOU BELIEVE THEY ARE.
+
+
 """
 
 # ---------------------------------------------------------------------------
@@ -1234,7 +1241,7 @@ Produce a markdown checklist where each item = ONE turn of the agent.
 # Task: <short title>
 
 - [ ] EXPLORE: read_files App.tsx/server.js/index.css + list_dir + glob src/**/*.tsx
-- [ ] write_file: src/index.css — dark design system, CSS vars, Google Font
+- [ ] write_file: src/index.css — modern design system, manrope google font
 - [ ] write_file (batch): Navbar.tsx + Footer.tsx + maybe ThemeProvider
 - [ ] write_file (batch): Landing.tsx + Dashboard.tsx + About.tsx
 - [ ] write_file (batch): routes/api.js + routes/items.js
