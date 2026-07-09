@@ -414,6 +414,7 @@
       <form id="createForm" method="post" action="/projects/create" enctype="multipart/form-data">
 
         <input type="hidden" name="prompt" id="hiddenPrompt" value="{{ initial_prompt or '' }}">
+        <input type="hidden" name="think_mode" value="{{ think_mode or 'normal' }}">
         {% if stashed_image %}
           <input type="hidden" name="image_base64" value="{{ stashed_image }}">
         {% endif %}

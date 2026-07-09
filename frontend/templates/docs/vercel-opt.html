@@ -8,7 +8,7 @@
 <p class="subtitle">The critical step where the AI refactors your Express backend into Vercel Serverless Functions.</p>
 
 <h2>The Architecture Conflict</h2>
-<p>While building your app, Gor://a runs a persistent Node.js Express server on port 3000 inside the WebContainer. However, Vercel does not support persistent, long-running Node servers out of the box. Vercel utilizes <strong>Serverless Functions</strong>.</p>
+<p>While building your app, Gor://a runs a persistent Node.js Express server on port 3000 inside your sandbox. However, Vercel does not support persistent, long-running Node servers out of the box. Vercel utilizes <strong>Serverless Functions</strong>.</p>
 <p>If you were to deploy your raw codebase to Vercel, the frontend would work, but every single API call (and your Supabase queries) would instantly return a 404 error.</p>
 
 <h2>Step 2: How Gor://a Fixes This Autonomously</h2>

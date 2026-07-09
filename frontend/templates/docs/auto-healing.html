@@ -12,7 +12,7 @@
 <p>Gor://a Builder completely automates this workflow with the <strong>Auto-Healing Loop</strong>.</p>
 
 <h2>1. The Interceptor & The Frenzy Vacuum</h2>
-<p>Inside the WebContainer, Gor://a injects a custom <code>console.error</code> and <code>window.onerror</code> interceptor. If Vite or Node.js throws an exception, it is instantly caught.</p>
+<p>Inside your project's sandbox, Gor://a injects a custom <code>console.error</code> and <code>window.onerror</code> interceptor directly into your app. If Vite or Node.js throws an exception, it is instantly caught.</p>
 
 <p>However, build tools like Vite often throw dozens of cascading errors at once (e.g., "Failed to resolve import X," followed by 10 component crash logs). To prevent blowing out your token limits, we engineered the <strong>Frenzy Vacuum</strong>:</p>
 <ul>
@@ -33,7 +33,7 @@
 <div class="callout success">
   <i class="ph-bold ph-first-aid"></i>
   <div class="callout-content">
-    <p><strong>The ALL_CLEAR Signal:</strong> Once the fix is applied, the WebContainer monitors the app. If the app runs for 8 consecutive seconds without a single error, the system fires the "ALL_CLEAR" event, dropping the loading overlay and presenting your stable, working application.</p>
+    <p><strong>The ALL_CLEAR Signal:</strong> Once the fix is applied, the sandbox keeps polling the app's logs. If the app runs for 8 consecutive seconds without a single error, the system fires the "ALL_CLEAR" event, dropping the loading overlay and presenting your stable, working application.</p>
   </div>
 </div>
 {% endblock %}
@@ -41,10 +41,10 @@
 {% block footer_nav %}
 <a href="/docs/webcontainers" class="docs-nav-btn prev">
   <span>Previous</span>
-  <strong>How WebContainers Work</strong>
+  <strong>How Your Sandbox Works</strong>
 </a>
-<a href="/docs/manual-editing" class="docs-nav-btn next">
+<a href="/docs/sub-agents" class="docs-nav-btn next">
   <span>Next</span>
-  <strong>Manual Code Editing</strong>
+  <strong>Delegating Sub-Tasks</strong>
 </a>
 {% endblock %}

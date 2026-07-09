@@ -23,7 +23,7 @@
 <p>We built the editor to be completely frictionless. There is no "Save" button.</p>
 <ul>
   <li><strong>Auto-Save:</strong> When you stop typing for 800 milliseconds, the editor automatically fires a payload to the backend, safely upserting your changes into the Supabase Virtual File System.</li>
-  <li><strong>Live Hot-Reload:</strong> Simultaneously, the changes are written directly into the WebContainer's memory (<code>webRunner.writeFile()</code>). Vite detects the file change and instantly hot-reloads your preview iframe.</li>
+  <li><strong>Live Hot-Reload:</strong> Simultaneously, the changes are written directly into your sandbox's file system. Vite detects the file change and instantly hot-reloads your preview iframe.</li>
 </ul>
 
 <div class="callout warning">
@@ -38,9 +38,9 @@
 {% endblock %}
 
 {% block footer_nav %}
-<a href="/docs/auto-healing" class="docs-nav-btn prev">
+<a href="/docs/sub-agents" class="docs-nav-btn prev">
   <span>Previous</span>
-  <strong>The Auto-Healing Loop</strong>
+  <strong>Delegating Sub-Tasks</strong>
 </a>
 <a href="/docs/file-tree" class="docs-nav-btn next">
   <span>Next</span>

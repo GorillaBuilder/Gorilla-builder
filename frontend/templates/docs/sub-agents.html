@@ -1,0 +1,41 @@
+{% extends "docs/base.html" %}
+
+{% block title %}Delegating Sub-Tasks{% endblock %}
+{% block breadcrumb %}Delegating Sub-Tasks{% endblock %}
+
+{% block content %}
+<h1>Delegating Sub-Tasks</h1>
+<p class="subtitle">For bounded investigations that shouldn't clutter the main conversation.</p>
+
+<h2>The Problem With One Long Conversation</h2>
+<p>Some requests need a chunk of exploratory back-and-forth before there's anything worth telling you — "figure out why the checkout form silently fails" might take a dozen file reads and a few failed hypotheses before landing on the actual bug. Dumping all of that into the main chat makes it noisy and burns context that would be better spent on the actual fix.</p>
+
+<h2>How Gor://a Handles It</h2>
+<p>For self-contained investigations, the agent can delegate to a fresh sub-agent scoped to just that task. The sub-agent works in the same project sandbox — same files, same running dev server — but starts with a clean slate and reports back only a summary: what it found, which files it touched, and its conclusion.</p>
+
+<div class="callout success">
+  <i class="ph-bold ph-tree-structure"></i>
+  <div class="callout-content">
+    <p><strong>What you'll see:</strong> A "Delegating…" activity card appears in the chat, just like a file read or a command run. Expand it to see what the sub-agent did — you don't have to wait for it to finish before you can see it's in progress.</p>
+  </div>
+</div>
+
+<h2>Guardrails</h2>
+<p>Delegation is intentionally bounded so it can't spiral into a runaway loop:</p>
+<ul>
+  <li><strong>One level deep:</strong> A sub-agent cannot itself delegate further — it works with the direct tools (read, write, run commands) only.</li>
+  <li><strong>Turn-capped:</strong> Each delegation runs for a handful of turns at most before it has to report back, whether or not it's fully "done."</li>
+  <li><strong>Token-metered:</strong> Sub-agent work is billed against your token balance exactly like any other agent turn — delegation doesn't make work free, it just keeps your main conversation focused.</li>
+</ul>
+{% endblock %}
+
+{% block footer_nav %}
+<a href="/docs/auto-healing" class="docs-nav-btn prev">
+  <span>Previous</span>
+  <strong>The Auto-Healing Loop</strong>
+</a>
+<a href="/docs/manual-editing" class="docs-nav-btn next">
+  <span>Next</span>
+  <strong>Manual Code Editing</strong>
+</a>
+{% endblock %}

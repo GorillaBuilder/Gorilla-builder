@@ -1,0 +1,44 @@
+{% extends "docs/base.html" %}
+
+{% block title %}Importing a Codebase{% endblock %}
+{% block breadcrumb %}Importing a Codebase{% endblock %}
+
+{% block content %}
+<h1>Importing a Codebase</h1>
+<p class="subtitle">Already have a project on GitHub? Start from it instead of a blank slate.</p>
+
+<h2>Why Import Instead of Prompt?</h2>
+<p>Not every project starts from zero. If you've already got a public GitHub repo — a side project, a prototype, something you started elsewhere — you can bring it straight into Gor://a and keep building with the agent instead of re-describing it from scratch.</p>
+
+<h2>How It Works</h2>
+<p>From the Dashboard, click the <i class="ph-bold ph-github-logo"></i> GitHub icon next to the prompt bar and paste the repo URL. Gor://a will:</p>
+<ol>
+  <li><strong>Download the repo:</strong> Pulls the default branch (falling back to <code>master</code> if there's no <code>main</code>) directly from GitHub — no authentication needed for public repos.</li>
+  <li><strong>Filter the noise:</strong> Skips <code>node_modules/</code>, build output, lockfiles, and binary assets, keeping only the source files that actually matter to the agent.</li>
+  <li><strong>Seed your project:</strong> Writes every remaining file into your new project before the sandbox ever boots, so the agent's first turn already sees your real file tree.</li>
+</ol>
+
+<div class="callout warning">
+  <i class="ph-bold ph-eye"></i>
+  <div class="callout-content">
+    <p><strong>The First Turn Is Read-Only:</strong> On import, the agent's first response is a quick orientation pass — it reads through your codebase and summarizes what it found (tech stack, structure, what the app does) without touching anything. It waits for your next instruction before making any changes, so you don't come back to a codebase that's already been rewritten out from under you.</p>
+  </div>
+</div>
+
+<h2>Limitations</h2>
+<ul>
+  <li>Only public repositories are supported right now — private repo import isn't available yet.</li>
+  <li>Very large repos are capped at a few hundred files and a per-file size limit, so massive monorepos will only bring in a relevant subset.</li>
+</ul>
+{% endblock %}
+
+{% block footer_nav %}
+<a href="/docs/figma-import" class="docs-nav-btn prev">
+  <span>Previous</span>
+  <strong>Importing from Figma</strong>
+</a>
+<a href="/docs/ideas-chips" class="docs-nav-btn next">
+  <span>Next</span>
+  <strong>Using "Ideas" Chips</strong>
+</a>
+{% endblock %}

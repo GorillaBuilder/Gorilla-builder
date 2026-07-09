@@ -1204,6 +1204,8 @@
 
             <input type="text" id="mainPromptInput" name="prompt" required placeholder="Ask Gor://a to build…" autocomplete="off" autofocus>
             <input type="hidden" id="figmaUrlInput" name="figma_url">
+            <input type="hidden" id="githubUrlInput" name="github_url">
+            <input type="hidden" id="thinkModeInput" name="think_mode" value="normal">
 
             <div class="input-actions">
 
@@ -1224,6 +1226,10 @@
                   <path fill-rule="evenodd" clip-rule="evenodd" d="M8 8C8 10.2091 9.79086 12 12 12H16V4H12C9.79086 4 8 5.79086 8 8Z" fill="#F24E1E"/>
                   <path fill-rule="evenodd" clip-rule="evenodd" d="M8 16C8 18.2091 9.79086 20 12 20H16V12H12C9.79086 12 8 13.7909 8 16Z" fill="#A259FF"/>
                 </svg>
+              </button>
+
+              <button type="button" class="icon-btn" id="githubImportBtn" title="Import from GitHub">
+                <i class="ph ph-github-logo"></i>
               </button>
 
               <button type="button" class="supabase-toggle-btn" id="supabaseToggleBtn" title="Provision PostgreSQL Database" data-linked="{% if user.supabase_access_token %}true{% else %}false{% endif %}">
@@ -1413,12 +1419,12 @@
   </div>
 
   <script>
+    // Mode selection is sent to the server as an explicit `think_mode` field
+    // ("fast" | "normal" | "deep") — the server prepends the matching
+    // steering instruction to the LLM's task text itself. We no longer
+    // mutate the visible prompt text on the client for this.
     let currentMode = 'fast';
-    const modePrefixes = {
-      fast: 'BE TOKEN EFFICIENT AND FAST AND DO THIS: \n\n',
-      normal: '',
-      deep: 'TAKE YOUR TIME AND THINK DEEPLY. Before writing any code, carefully plan your architecture, reason through edge cases, and think about potential failure points. Quality and thoroughness over speed and do this:\n\n'
-    };
+    const thinkModeInput = document.getElementById('thinkModeInput');
 
     const modeWrap    = document.getElementById('modeWrap');
     const modeTrigger = document.getElementById('modeTrigger');
@@ -1437,6 +1443,7 @@
           currentMode = mode;
           modeTrigger.dataset.mode = mode;
           modeTrigger.querySelector('.mode-label').textContent = labels[mode];
+          if (thinkModeInput) thinkModeInput.value = mode;
           modeOptions.forEach(o => o.classList.remove('active'));
           opt.classList.add('active');
           modeWrap.classList.remove('open');
@@ -1449,14 +1456,17 @@
 
     window.addEventListener('pageshow', () => {
       const figmaHidden    = document.getElementById('figmaUrlInput');
+      const githubHidden   = document.getElementById('githubUrlInput');
       const supabaseHidden = document.getElementById('useSupabaseInput');
       const imgHidden      = document.getElementById('imageBase64');
       const mainPrompt     = document.getElementById('mainPromptInput');
       const fBtn           = document.getElementById('figmaUploadBtn');
+      const gBtn           = document.getElementById('githubImportBtn');
       const sBtn           = document.getElementById('supabaseToggleBtn');
       const sbmBtn         = document.getElementById('submitPromptBtn');
 
       if (figmaHidden)    figmaHidden.value    = '';
+      if (githubHidden)   githubHidden.value   = '';
       if (supabaseHidden) supabaseHidden.value = 'false';
       if (imgHidden)      imgHidden.value      = '';
 
@@ -1466,6 +1476,9 @@
         if (fBtn) fBtn.style.background = '';
         if (sBtn) sBtn.classList.remove('input-action-locked');
       }
+
+      if (mainPrompt) mainPrompt.setAttribute('required', 'required');
+      if (gBtn) gBtn.style.background = '';
 
       if (sbmBtn) {
         sbmBtn.innerHTML = '<i class="ph-bold ph-arrow-up"></i>';
@@ -1477,6 +1490,7 @@
         currentMode = 'fast';
         modeTrigger.dataset.mode = 'fast';
         modeTrigger.querySelector('.mode-label').textContent = 'Pluma';
+        if (thinkModeInput) thinkModeInput.value = 'fast';
         modeOptions.forEach(o => o.classList.toggle('active', o.dataset.mode === 'fast'));
       }
     });
@@ -1509,13 +1523,32 @@
       });
     }
 
-    const figmaBtn         = document.getElementById('figmaUploadBtn');
-    const supabaseBtn      = document.getElementById('supabaseToggleBtn');
-    const promptInput      = document.getElementById('mainPromptInput');
-    const figmaHiddenInput = document.getElementById('figmaUrlInput');
-    const useSupabaseInput = document.getElementById('useSupabaseInput');
-    const mainForm         = document.getElementById('mainPromptForm');
-    const submitBtn        = document.getElementById('submitPromptBtn');
+    const figmaBtn          = document.getElementById('figmaUploadBtn');
+    const supabaseBtn       = document.getElementById('supabaseToggleBtn');
+    const promptInput       = document.getElementById('mainPromptInput');
+    const figmaHiddenInput  = document.getElementById('figmaUrlInput');
+    const useSupabaseInput  = document.getElementById('useSupabaseInput');
+    const mainForm          = document.getElementById('mainPromptForm');
+    const submitBtn         = document.getElementById('submitPromptBtn');
+    const githubImportBtn   = document.getElementById('githubImportBtn');
+    const githubHiddenInput = document.getElementById('githubUrlInput');
+
+    if (githubImportBtn) {
+      githubImportBtn.addEventListener('click', () => {
+        const url = window.prompt('GitHub repo URL:');
+        if (!url || !url.trim()) return;
+        githubHiddenInput.value = url.trim();
+        githubImportBtn.style.background = 'rgba(10,207,131,0.1)';
+        // A repo import is a valid submission on its own — don't force the
+        // user to also type a prompt.
+        if (promptInput) {
+          promptInput.removeAttribute('required');
+          if (!promptInput.value.trim()) {
+            promptInput.placeholder = 'Repo loaded — add instructions or just hit build…';
+          }
+        }
+      });
+    }
 
     function toggleFigmaMode() {
       const on = promptInput.placeholder.includes('Figma');
@@ -1546,15 +1579,14 @@
 
     if (mainForm) {
       mainForm.addEventListener('submit', (e) => {
-        const val    = promptInput.value.trim();
-        const prefix = modePrefixes[currentMode] || '';
+        const val = promptInput.value.trim();
 
         if (val.includes('figma.com/')) {
           figmaHiddenInput.value = val;
-          promptInput.value = prefix + "Build a pixel-perfect React and Tailwind replica of the design structure. I have provided the exact layout rules, spacing, typography, and hex colors in the `.gorilla/figma.json` file. Read that file and implement it exactly.";
+          promptInput.value = "Build a pixel-perfect React and Tailwind replica of the design structure. I have provided the exact layout rules, spacing, typography, and hex colors in the `.gorilla/figma.json` file. Read that file and implement it exactly.";
         } else {
           figmaHiddenInput.value = '';
-          promptInput.value = prefix + val;
+          promptInput.value = val;
         }
 
         if (submitBtn) {

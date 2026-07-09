@@ -1,40 +1,40 @@
 {% extends "docs/base.html" %}
 
-{% block title %}How WebContainers Work{% endblock %}
-{% block breadcrumb %}How WebContainers Work{% endblock %}
+{% block title %}How Your Sandbox Works{% endblock %}
+{% block breadcrumb %}How Your Sandbox Works{% endblock %}
 
 {% block content %}
-<h1>How WebContainers Work</h1>
-<p class="subtitle">Running a live, headless Node.js backend directly inside your browser tab.</p>
+<h1>How Your Sandbox Works</h1>
+<p class="subtitle">Every project gets a real, isolated cloud environment — not a mock, not a simulation.</p>
 
 <h2>The Legacy Cloud Trap</h2>
 <p>Most AI coding platforms use one of two broken models to run your code:</p>
 <ol>
   <li><strong>Static Only:</strong> They only generate HTML/CSS/React and mock the data, leaving you stranded when you actually need a database or user authentication.</li>
-  <li><strong>Cloud Compute:</strong> They spin up expensive, sluggish AWS/GCP Docker containers for every user, which introduces massive latency and forces them to charge you $40/month just to cover server costs.</li>
+  <li><strong>Slow Cloud Compute:</strong> They spin up a fresh, cold Docker container for every request, which introduces massive latency every time the agent needs to run a command.</li>
 </ol>
 
-<h2>The Gor://a Solution: WebContainers</h2>
-<p>Gor://a Builder bypasses the cloud entirely. We utilize WebContainer technology to boot a micro-operating system <em>directly inside your browser's memory</em>. This means you have a native Node.js runtime executing locally on your machine, orchestrated by our remote Python agents.</p>
+<h2>The Gor://a Solution: Live Sandboxes</h2>
+<p>Every project you build runs inside its own isolated cloud sandbox — a real Linux environment with a real Node.js runtime, real file system, and a real terminal. The agent writes files, runs <code>npm install</code>, and starts your dev server exactly like a developer would on their own machine, just orchestrated remotely instead of on your device.</p>
 
 <h3>The Boot Sequence</h3>
-<p>When the Coder agent finishes its blueprint, the <code>webrunner.js</code> orchestrator takes over:</p>
+<p>When the agent finishes planning your app, it takes over the sandbox:</p>
 <ol>
-  <li><strong>Mounting:</strong> It pulls your codebase from the Supabase Virtual File System (VFS) and mounts it into the browser's memory.</li>
-  <li><strong>Dependency Resolution (<code>pnpm install</code>):</strong> It scans the <code>package.json</code> the AI generated and downloads dependencies at lightning speed directly from the NPM registry.</li>
-  <li><strong>The Dev Server (<code>npm run dev</code>):</strong> It boots up Vite and Express simultaneously.</li>
-  <li><strong>Live Preview:</strong> It binds to a local, credentialless URL and displays the live app in the Editor's iframe.</li>
+  <li><strong>Provisioning:</strong> A dedicated sandbox spins up and your project's files are synced into it.</li>
+  <li><strong>Dependency Resolution (<code>npm install</code>):</strong> It scans the <code>package.json</code> the AI generated and installs dependencies inside the sandbox.</li>
+  <li><strong>The Dev Server (<code>npm run dev</code>):</strong> It boots up Vite and Express, and verifies both are actually responding before moving on.</li>
+  <li><strong>Live Preview:</strong> The sandbox exposes a live URL that streams straight into the Editor's preview pane.</li>
 </ol>
 
 <div class="callout warning">
   <i class="ph-bold ph-shield-check"></i>
   <div class="callout-content">
-    <p><strong>Cross-Origin Security:</strong> To run a full operating system in a browser tab, Gor://a uses strict <code>Cross-Origin-Embedder-Policy: credentialless</code> headers. This ensures that your local environment is highly secure and perfectly isolated from the rest of the web.</p>
+    <p><strong>Isolation:</strong> Every project's sandbox is fully separated from every other project and from Gor://a's own infrastructure. File operations are strictly confined to your project's own directory — the agent can't read or touch anything outside it.</p>
   </div>
 </div>
 
-<h2>Why This is a Game Changer for Indies</h2>
-<p>Because the compute happens on <em>your</em> device, Gor://a doesn't pay for idle servers. This architectural breakthrough is exactly how we can afford to give you 500,000 free tokens and full-stack capabilities without pricing you out of the market. Zero latency, zero cloud costs, infinite possibilities.</p>
+<h2>Why This Matters</h2>
+<p>Because your app runs in a real environment instead of a browser-side simulation, you get real npm packages, a real filesystem, and real command execution — the same thing you'd get running the project locally, minus the setup. That's also what makes the auto-healing loop possible: the agent can see the dev server's actual logs and actual exit codes, not an approximation of them.</p>
 {% endblock %}
 
 {% block footer_nav %}

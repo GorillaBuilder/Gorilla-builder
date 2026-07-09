@@ -15,9 +15,9 @@
 <h3>1. The Swarm Console (Left Sidebar)</h3>
 <p>This is where you communicate with your agents. Unlike standard AI tools, this isn't just a chat box—it's a live timeline of multi-agent orchestration.</p>
 <ul>
-  <li><strong>The Thought Timeline:</strong> Watch the Planner, Reasoner, and Coder communicate via MCP (Machine Communication Protocol). You can see exactly which files are being analyzed and updated in real-time.</li>
-  <li><strong>The Progress HUD:</strong> Live indicators showing the current phase (Planner, Coder, Files) and the WebContainer boot status.</li>
-  <li><strong>The Input Matrix:</strong> Submit text prompts, upload UI reference images mid-chat, or hit the "Xmode" button for deep architectural refactoring.</li>
+  <li><strong>The Thought Timeline:</strong> Watch the agent think out loud as it plans, then reads and writes files. You can see exactly which files are being analyzed and updated in real-time.</li>
+  <li><strong>The Progress HUD:</strong> Live indicators showing the current phase (Planner, Coder, Files) and the sandbox's boot status.</li>
+  <li><strong>The Input Matrix:</strong> Submit text prompts or upload UI reference images mid-chat. (Pick "Forge" mode for deep architectural planning before you even create the project — see <a href="/docs/quickstart">Quickstart</a>.)</li>
 </ul>
 
 <h3>2. The Explorer (File Tree)</h3>
@@ -41,7 +41,7 @@
 <div class="callout success">
   <i class="ph-bold ph-magic-wand"></i>
   <div class="callout-content">
-    <p><strong>Frictionless Iteration:</strong> Because the IDE is wired directly to the WebContainer, asking the AI to "change the button to red" updates the file in the VFS, which hot-reloads the preview iframe in milliseconds. You never have to touch a save button.</p>
+    <p><strong>Frictionless Iteration:</strong> Because the IDE is wired directly to your sandbox, asking the AI to "change the button to red" updates the file in the VFS, which hot-reloads the preview iframe in milliseconds. You never have to touch a save button.</p>
   </div>
 </div>
 {% endblock %}
@@ -53,6 +53,6 @@
 </a>
 <a href="/docs/webcontainers" class="docs-nav-btn next">
   <span>Next</span>
-  <strong>How WebContainers Work</strong>
+  <strong>How Your Sandbox Works</strong>
 </a>
 {% endblock %}

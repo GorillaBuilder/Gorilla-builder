@@ -8,25 +8,28 @@
 <p>Let's take your idea from a single sentence to a live, full-stack application in under 3 minutes. This guide will walk you through the entire autonomous lifecycle of a Gor://a Builder project.</p>
 
 <h2>Step 1: Crafting the Initial Prompt</h2>
-<p>From the Dashboard, locate the main prompt bar. You have three powerful ways to initiate a build:</p>
+<p>From the Dashboard, locate the main prompt bar. You have four ways to start a build:</p>
 <ol>
   <li><strong>Text Prompt:</strong> Type your idea explicitly. Be descriptive about functionality, backend requirements, and layout.</li>
   <li><strong>Image Reference:</strong> Click the <i class="ph-bold ph-image"></i> icon to upload a screenshot of a UI you want the AI to replicate pixel-for-pixel.</li>
   <li><strong>Figma Link:</strong> Paste a Figma URL to trigger our native <strong>Figma Compiler</strong>. Our AgentSkills will parse the design nodes and seamlessly convert them into a Tailwind TSX layout.</li>
+  <li><strong>GitHub Repo:</strong> Click the <i class="ph-bold ph-github-logo"></i> icon and paste a public repo URL to start from an existing codebase instead of a blank slate — see <a href="/docs/github-import">Importing a Codebase</a>.</li>
 </ol>
+
+<p>Next to the prompt bar, the mode dropdown lets you pick how the agent approaches your request: <strong>Pluma</strong> is token-efficient and fast for straightforward builds, while <strong>Forge</strong> tells the agent to slow down, plan the architecture first, and reason through edge cases before writing code — worth it for complex, multi-feature apps.</p>
 
 <pre><code>// Example of a great initial prompt:
 "Build a SaaS dashboard for tracking SEO metrics. 
 Include a Node.js backend with Supabase integration to store user data. 
 Add Google Sign-in, and ensure the UI uses dark mode glassmorphism."</code></pre>
 
-<h2>Step 2: Watch the Swarm Choreography</h2>
-<p>Once you hit submit, you'll enter the Editor. On the left side, the Agent Activity feed will show the Multi-Agent Swarm thinking out loud via our internal MCP (Machine Communication Protocol):</p>
+<h2>Step 2: Watch the Agent Work</h2>
+<p>Once you hit submit, you'll enter the Editor. On the left side, the Agent Activity feed will show the agent thinking out loud as it works through each phase:</p>
 
 <ul>
-  <li><strong>Phase 1: Planning.</strong> The Planner maps out the React components and the Express API routes.</li>
-  <li><strong>Phase 2: Coding.</strong> The Coder reads your existing boilerplate files, generates the new Node.js infrastructure, and wires the frontend React hooks to your backend APIs.</li>
-  <li><strong>Phase 3: Saving.</strong> The AI commits the 22,000+ lines of infrastructure to the Virtual File System.</li>
+  <li><strong>Phase 1: Planning.</strong> The agent maps out the React components and the Express API routes it'll need.</li>
+  <li><strong>Phase 2: Coding.</strong> It reads your existing boilerplate files, generates the new Node.js infrastructure, and wires the frontend React hooks to your backend APIs.</li>
+  <li><strong>Phase 3: Saving.</strong> The agent commits the new files to the Virtual File System.</li>
 </ul>
 
 <div class="callout warning">
@@ -36,16 +39,16 @@ Add Google Sign-in, and ensure the UI uses dark mode glassmorphism."</code></pre
   </div>
 </div>
 
-<h2>Step 3: The WebContainer Boot Sequence</h2>
-<p>Once the AI commits the code, a live, headless Node.js environment boots up directly inside your browser tab.</p>
+<h2>Step 3: The Sandbox Boot Sequence</h2>
+<p>Once the AI commits the code, a live, headless Node.js environment boots up inside your project's own isolated cloud sandbox.</p>
 <ol>
-  <li><strong>Dependency Sync:</strong> The system automatically runs <code>pnpm install</code> to fetch any libraries the AI utilized.</li>
+  <li><strong>Dependency Sync:</strong> The system automatically runs <code>npm install</code> to fetch any libraries the AI utilized.</li>
   <li><strong>Dev Server Start:</strong> It runs <code>npm run dev</code>, booting both the Vite frontend and the Express backend simultaneously.</li>
   <li><strong>The Gateway Injection:</strong> If you requested AI features or Auth, the Gor://a Gateway automatically injects the necessary security headers and routes. <strong>Zero API keys required.</strong></li>
 </ol>
 
 <h2>Step 4: Auto-Healing & Iteration</h2>
-<p>Unlike other platforms that leave you stranded with a broken app, Gor://a features a <strong>Frenzy Vacuum</strong> and an <strong>Auto-Healing Loop</strong>. If your app throws a Node.js exception or a React syntax error, the WebContainer intercepts the stack trace, waits for the error cascade to finish, and silently passes the logs back to the AI Debugger to fix it autonomously.</p>
+<p>Unlike other platforms that leave you stranded with a broken app, Gor://a features a <strong>Frenzy Vacuum</strong> and an <strong>Auto-Healing Loop</strong>. If your app throws a Node.js exception or a React syntax error, your sandbox intercepts the stack trace, waits for the error cascade to finish, and silently passes the logs back to the AI Debugger to fix it autonomously.</p>
 
 <h2>Step 5: One-Click Vercel Deployment</h2>
 <p>When you are ready to launch your SaaS to the world, click the <strong>Deploy</strong> button. Gor://a will automatically optimize your <code>server.js</code> for serverless edge functions, push the code to a private GitHub repository, and trigger a live Vercel deployment. You just went from prompt to production in one sitting.</p>

@@ -18,7 +18,7 @@
 
 <ol>
   <li><strong>Writing the Migration:</strong> The Coder agent writes a standard SQL file and saves it to the <code>migrations/</code> directory in your Virtual File System (e.g., <code>migrations/001_init.sql</code>).</li>
-  <li><strong>API Execution:</strong> The Gor://a backend detects that a <code>.sql</code> file was generated. It immediately pauses the WebContainer boot sequence.</li>
+  <li><strong>API Execution:</strong> The Gor://a backend detects that a <code>.sql</code> file was generated. It immediately pauses the sandbox boot sequence.</li>
   <li><strong>The Remote Query:</strong> Using your secure Supabase Management Token, the engine fires the raw SQL directly into the Supabase Postgres instance via their <code>/v1/projects/{ref}/database/query</code> REST API endpoint.</li>
 </ol>
 

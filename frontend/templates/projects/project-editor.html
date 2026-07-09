@@ -8,11 +8,8 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600;9..40,700&family=DM+Mono:wght@300;400;500&display=swap" rel="stylesheet">
   <script src="https://unpkg.com/@phosphor-icons/web"></script>
-  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
 
   <script type="module">
-    import { marked } from "https://esm.sh/marked@12.0.1";
-    import DOMPurify from "https://esm.sh/dompurify@3.0.9";
     import { EditorState } from "https://esm.sh/@codemirror/state@6.4.1";
     import { EditorView, keymap, lineNumbers } from "https://esm.sh/@codemirror/view@6.26.3?deps=@codemirror/state@6.4.1";
     import { defaultKeymap, history, historyKeymap } from "https://esm.sh/@codemirror/commands@6.5.0?deps=@codemirror/state@6.4.1,@codemirror/view@6.26.3";
@@ -231,6 +228,39 @@
     .narration li { margin-bottom: 3px; color: var(--muted); }
     .narration li::marker { color: var(--accent); }
     @keyframes fadeUp { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
+
+    /* ── CODE BLOCKS (syntax highlighted) ────────────────────────────────── */
+    .code-block {
+      margin: 8px 0; border: 1px solid var(--line-2);
+      border-radius: var(--radius-sm); overflow: hidden;
+      background: var(--bg-2);
+    }
+    .code-block-head {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 6px 10px; background: var(--bg-3);
+      border-bottom: 1px solid var(--line);
+      font-family: 'DM Mono', monospace; font-size: 10.5px;
+    }
+    .code-block-lang { color: var(--dim); text-transform: uppercase; letter-spacing: 0.04em; }
+    .code-copy-btn {
+      display: flex; align-items: center; gap: 4px;
+      background: transparent; border: 1px solid var(--line-2);
+      color: var(--muted); border-radius: var(--radius-sm);
+      padding: 2px 7px; font-size: 10.5px; font-family: 'DM Mono', monospace;
+      cursor: pointer; transition: all 0.15s var(--ease);
+    }
+    .code-copy-btn:hover { color: var(--fg); border-color: var(--line-3); background: rgba(255,255,255,0.04); }
+    .code-block pre {
+      margin: 0; padding: 12px 14px; overflow-x: auto;
+      font-family: 'DM Mono', monospace; font-size: 12px; line-height: 1.6;
+    }
+    .code-block code.hljs { background: transparent; padding: 0; border: none; color: var(--fg); }
+    .hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-tag { color: oklch(0.72 0.17 330); }
+    .hljs-string, .hljs-attr, .hljs-template-tag { color: oklch(0.78 0.14 145); }
+    .hljs-number, .hljs-built_in, .hljs-type { color: oklch(0.75 0.15 60); }
+    .hljs-comment, .hljs-quote { color: var(--dim); font-style: italic; }
+    .hljs-title, .hljs-function, .hljs-name { color: var(--accent); }
+    .hljs-variable, .hljs-params { color: var(--fg); }
 
     .activity-group {
       display: flex; flex-direction: column; gap: 4px;
@@ -586,12 +616,25 @@
       font-weight: 500; letter-spacing: -0.005em; position: relative; z-index: 1;
     }
 
-    .wave { display: flex; gap: 3px; align-items: center; opacity: 0; transition: opacity 0.3s; }
-    .wave.active { opacity: 1; }
-    .wave span { width: 2px; height: 10px; background: var(--accent); border-radius: 1px; animation: wv 1s infinite ease-in-out; }
-    .wave span:nth-child(2) { animation-delay: 0.12s; }
-    .wave span:nth-child(3) { animation-delay: 0.24s; }
-    @keyframes wv { 0%,100%{transform:scaleY(0.5);opacity:0.4;} 50%{transform:scaleY(1.8);opacity:1;} }
+    .ascii-spinner {
+      display: inline-block; width: 1.1em; text-align: center;
+      font-family: 'DM Mono', monospace; font-size: 13px;
+      color: var(--accent); opacity: 0; transition: opacity 0.3s;
+    }
+    .ascii-spinner.active { opacity: 1; }
+
+    /* ── EMPTY CHAT STATE ─────────────────────────────────────────────── */
+    .chat-empty {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 10px; height: 100%; min-height: 200px;
+      color: var(--dim); font-family: 'DM Mono', monospace;
+      user-select: none;
+    }
+    .chat-empty pre {
+      margin: 0; font-size: 11px; line-height: 1.3; color: var(--accent-dim);
+      text-align: center;
+    }
+    .chat-empty span { font-size: 12px; color: var(--dim); letter-spacing: -0.005em; }
 
     /* SSE status indicator */
     .sse-indicator {
@@ -658,13 +701,15 @@
 
   <div class="status-strip">
     <div class="status-left">
-      <div class="wave" id="loadingWave"><span></span><span></span><span></span></div>
+      <span class="ascii-spinner" id="loadingWave">⠋</span>
       <span class="status-label" id="progressText">Ready</span>
     </div>
     <div class="prog-wrap"><div class="prog-bar" id="progressBar"></div></div>
   </div>
 
-  <div class="chat" id="chat"></div>
+  <div class="chat" id="chat">
+    <div class="chat-empty" id="chatEmpty"><pre id="chatEmptyArt"></pre><span>Ask Gor://a to build something</span></div>
+  </div>
 
   <div class="suggestion-strip" id="suggestionStrip">
     <button class="sugg-chip" onclick="useSuggestion(this)"><i class="ph ph-check-circle"></i> Verify it works</button>
@@ -808,10 +853,39 @@ function _showGithubGuidance() {
 <script type="module">
 import { marked } from 'https://esm.sh/marked@9.1.2';
 import DOMPurify from 'https://esm.sh/dompurify@3.0.6';
+import hljs from 'https://esm.sh/highlight.js@11.9.0';
 
-const PROJECT_ID     = "{{ project_id }}";
-const INITIAL_PROMPT = {{ initial_prompt | tojson }};
-const HAS_SUPABASE   = {{ 'true' if has_supabase else 'false' }};
+const _renderer = new marked.Renderer();
+_renderer.code = (code, lang) => {
+  const language = hljs.getLanguage(lang) ? lang : 'plaintext';
+  const highlighted = hljs.highlight(code, { language }).value;
+  const escapedForCopy = code.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+  return `<div class="code-block">
+    <div class="code-block-head">
+      <span class="code-block-lang">${language}</span>
+      <button class="code-copy-btn" data-code="${escapedForCopy}"><i class="ph ph-copy"></i> Copy</button>
+    </div>
+    <pre><code class="hljs language-${language}">${highlighted}</code></pre>
+  </div>`;
+};
+marked.setOptions({ renderer: _renderer });
+
+document.addEventListener('click', (e) => {
+  const btn = e.target.closest('.code-copy-btn');
+  if (!btn) return;
+  const text = btn.getAttribute('data-code')
+    .replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+  navigator.clipboard.writeText(text).then(() => {
+    const original = btn.innerHTML;
+    btn.innerHTML = '<i class="ph ph-check"></i> Copied';
+    setTimeout(() => { btn.innerHTML = original; }, 1500);
+  });
+});
+
+const PROJECT_ID        = "{{ project_id }}";
+const INITIAL_PROMPT    = {{ initial_prompt | tojson }};
+const INITIAL_THINK_MODE = {{ initial_think_mode | tojson }};
+const HAS_SUPABASE      = {{ 'true' if has_supabase else 'false' }};
 const PROJECT_HAS_DB = {{ 'true' if project_has_db else 'false' }};
 const GAME_URL       = `https://gorilla-games.vercel.app`;
 
@@ -1098,7 +1172,8 @@ function cleanPromptText(t) {
 const VERB_ICONS = {
   edit:'ph-pencil-simple', create:'ph-plus', delete:'ph-trash',
   install:'ph-package', execute:'ph-terminal', fetch:'ph-globe',
-  database:'ph-database', read:'ph-eye', scan:'ph-magnifying-glass', git:'ph-git-branch'
+  database:'ph-database', read:'ph-eye', scan:'ph-magnifying-glass', git:'ph-git-branch',
+  delegate:'ph-tree-structure', screenshot:'ph-camera'
 };
 function iconFor(verb) { return VERB_ICONS[verb] || 'ph-terminal'; }
 
@@ -1109,11 +1184,18 @@ function hideLoader() {
 
 function resetGroup() { currentGroup = null; }
 function ensureGroup() {
+  hideChatEmpty();
   if (!currentGroup) { currentGroup = document.createElement('div'); currentGroup.className = 'activity-group'; chat.appendChild(currentGroup); }
   return currentGroup;
 }
 
+function hideChatEmpty() {
+  const el = $("chatEmpty");
+  if (el) el.style.display = "none";
+}
+
 function addUserMessage(text) {
+  hideChatEmpty();
   resetGroup();
   const el = document.createElement('div'); el.className = 'msg-user'; el.textContent = text;
   chat.appendChild(el); chat.scrollTop = chat.scrollHeight;
@@ -1121,6 +1203,7 @@ function addUserMessage(text) {
 }
 
 async function addNarration(text, withTyping = true) {
+  hideChatEmpty();
   resetGroup();
   const el = document.createElement('div'); el.className = 'narration';
   chat.appendChild(el);
@@ -1251,7 +1334,7 @@ function setInputState(locked) {
       banner = document.createElement('div');
       banner.id = "agentBanner";
       banner.style.cssText = "padding:6px 14px;background:oklch(0.38 0.12 252 / 0.95);border-bottom:1px solid oklch(0.6 0.2 248/0.25);display:flex;align-items:center;gap:10px;flex-shrink:0;";
-      banner.innerHTML = '<div class="wave active" style="opacity:1;"><span></span><span></span><span></span></div><span id="agentBannerText" style="font-size:12px;font-weight:500;color:rgba(255,255,255,0.9);flex:1;letter-spacing:-0.005em;">Gorilla is working…</span><span id="agentElapsed" style="font-size:11px;font-family:\'DM Mono\',monospace;color:rgba(255,255,255,0.45);">0s</span>';
+      banner.innerHTML = '<span id="agentBannerText" style="font-size:12px;font-weight:500;color:rgba(255,255,255,0.9);flex:1;letter-spacing:-0.005em;">Gorilla is working…</span><span id="agentElapsed" style="font-size:11px;font-family:\'DM Mono\',monospace;color:rgba(255,255,255,0.45);">0s</span>';
       const chatEl = $("chat");
       if (chatEl && chatEl.parentNode) chatEl.parentNode.insertBefore(banner, chatEl);
     }
@@ -1302,6 +1385,17 @@ function setConn(state) {
   dot.className = "dot" + (state === "ok" ? " ok" : state === "bad" ? " bad" : "");
   setStatusBarConnection(state);
 }
+// A small braille-dot cycle, the same style of ASCII spinner CLI tools like
+// Claude Code use, instead of a generic CSS "wave" bar animation.
+const ASCII_SPINNER_FRAMES = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+let _asciiSpinnerFrame = 0;
+setInterval(() => {
+  const el = $("loadingWave");
+  if (!el || !el.classList.contains("active")) return;
+  _asciiSpinnerFrame = (_asciiSpinnerFrame + 1) % ASCII_SPINNER_FRAMES.length;
+  el.textContent = ASCII_SPINNER_FRAMES[_asciiSpinnerFrame];
+}, 80);
+
 function setProgress(text, pct) {
   if (text) {
     $("progressText").textContent = text;
@@ -1663,7 +1757,7 @@ async function bootSandboxIfNeeded() {
 // KEY FIX: We wait for SSE to confirm open BEFORE firing /agent/start.
 // This guarantees no events are emitted before the frontend is subscribed.
 // ─────────────────────────────────────────────────────────────────────────
-async function triggerAgent(promptText) {
+async function triggerAgent(promptText, thinkMode) {
   if (!promptText && !currentAttachedImage) return;
   resetGroup();
 
@@ -1671,6 +1765,7 @@ async function triggerAgent(promptText) {
   const isDbReq = dbKeywords.test(promptText);
   const formData = new FormData();
   formData.append("agent_type", isDbReq ? "supabase" : "fast");
+  formData.append("think_mode", thinkMode || "normal");
 
   if (isDbReq && !PROJECT_HAS_DB && !HAS_SUPABASE) {
     await addNarration("To use a database, please link your Supabase account from Dashboard settings.", false);
@@ -1700,10 +1795,20 @@ async function triggerAgent(promptText) {
   await _streamOpenOrTimeout(8000);
 
   fetch(`/api/project/${PROJECT_ID}/agent/start`, { method: "POST", body: formData })
-    .then(res => {
+    .then(async res => {
       if (!res.ok) {
         console.error("Agent start failed:", res.status);
         setInputState(false);
+        return;
+      }
+      // The endpoint can return 200 with { started: false, error } — e.g. an
+      // agent run is already active, or the token limit was hit. Without
+      // checking this, the UI stayed locked forever with no explanation.
+      let data = null;
+      try { data = await res.json(); } catch {}
+      if (data && data.started === false) {
+        setInputState(false);
+        if (data.error) await addNarration(`⚠️ ${data.error}`, false);
       }
     })
     .catch(err => {
@@ -1919,6 +2024,9 @@ async function loadAnalytics() {
 // ── INIT ──────────────────────────────────────────────────────────────────
 
 (async () => {
+  const artEl = $("chatEmptyArt");
+  if (artEl) artEl.textContent = "  ╭─────────╮\n  │ gor://a │\n  ╰─────────╯";
+
   loadChatHistory();
   await refreshFiles();
   try { await loadFile(currentFile); } catch(e) {}
@@ -1933,7 +2041,7 @@ async function loadAnalytics() {
     // This is the most critical path — a cold page load + cold Koyeb dyno.
     setTimeout(async () => {
       await _streamOpenOrTimeout(8000);
-      triggerAgent(INITIAL_PROMPT);
+      triggerAgent(INITIAL_PROMPT, INITIAL_THINK_MODE);
     }, 800);
   } else {
     // No initial prompt — open SSE in background for passive event listening.

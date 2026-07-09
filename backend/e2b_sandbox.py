@@ -100,6 +100,28 @@ def _strip_app_prefix(p: str) -> str:
     return p
 
 
+def _resolve_app_path(p: str) -> str:
+    """Resolve an agent-supplied path to an absolute path strictly confined to
+    APP_DIR. Prevents `../` traversal and absolute paths (e.g. `/etc/passwd`)
+    from escaping the project sandbox, regardless of how the LLM formats the
+    path (with/without an `/app` prefix, with leading slash, etc.)."""
+    rel = _strip_app_prefix(p).lstrip("/")
+    full = os.path.normpath(f"{APP_DIR}/{rel}")
+    if full != APP_DIR and not full.startswith(APP_DIR + "/"):
+        # Traversal attempted to escape APP_DIR — clamp back to the root.
+        full = APP_DIR
+    return full
+
+
+def _resolve_app_rel(p: str) -> str:
+    """Same confinement as _resolve_app_path but returns the path relative
+    to APP_DIR (no leading slash), for display/storage purposes."""
+    full = _resolve_app_path(p)
+    if full == APP_DIR:
+        return ""
+    return full[len(APP_DIR) + 1:]
+
+
 def _is_binary_path(p: str) -> bool:
     BINARY_EXTS = {
         ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico",
@@ -204,6 +226,15 @@ class SandboxSession:
     _agent_written_paths: Set[str]  = field(default_factory=set,  repr=False)
     _dev_server_up:  bool           = field(default=False,        repr=False)
     _has_ripgrep:    Optional[bool] = field(default=None,         repr=False)
+    # Recursion guard for spawn_subagent: True while a sub-agent run is in
+    # flight for this session, so a nested LineageAgent cannot itself spawn
+    # another sub-agent (hard depth limit of 1, enforced at runtime rather
+    # than by trying to filter the sub-agent's tool list).
+    _in_subagent:    bool           = field(default=False,        repr=False)
+    # Base64 PNG from the most recent preview_screenshot call this turn, if
+    # any. Consumed (and cleared) by _do_run_agent_turn after each turn's
+    # read calls execute, then threaded into the next agent.run(screenshot_b64=...).
+    _last_screenshot_b64: Optional[str] = field(default=None,     repr=False)
 
 
 class E2BSandboxManager:
@@ -395,7 +426,7 @@ class E2BSandboxManager:
     # Native file write
     # -----------------------------------------------------------
     def _write_one_file_sync(self, sbx, rel_path: str, content: str) -> bool:
-        full = f"{APP_DIR}/{rel_path}"
+        full = _resolve_app_path(rel_path)
         dirp = "/".join(full.split("/")[:-1])
 
         try:
@@ -431,7 +462,7 @@ class E2BSandboxManager:
         sbx = session.sandbox
 
         async def _write_one(wf: Dict[str, str]) -> Tuple[str, bool]:
-            rel  = wf.get("path", "").strip()
+            rel  = _resolve_app_rel(wf.get("path", "").strip())
             body = wf.get("content", "")
 
             if not rel:
@@ -621,8 +652,8 @@ class E2BSandboxManager:
         sbx = session.sandbox
 
         def _read_one(rel: str) -> Tuple[str, str]:
-            rel = _strip_app_prefix(rel)
-            full = f"{APP_DIR}/{rel}" if not rel.startswith("/") else rel
+            full = _resolve_app_path(rel)
+            rel = _resolve_app_rel(rel)
             try:
                 if hasattr(sbx, "files") and hasattr(sbx.files, "read"):
                     content = sbx.files.read(full)
@@ -651,8 +682,8 @@ class E2BSandboxManager:
         self, session: SandboxSession, project_id: str, params: Dict[str, str],
     ) -> str:
         path = params.get("path", ".").strip() or "."
-        rel  = _strip_app_prefix(path)
-        full = f"{APP_DIR}/{rel}" if rel and rel != "." else APP_DIR
+        full = _resolve_app_path(path) if path != "." else APP_DIR
+        rel  = _resolve_app_rel(path) if path != "." else ""
 
         activity_id = self._next_activity_id(project_id)
         self._emit_activity_start(
@@ -691,8 +722,8 @@ class E2BSandboxManager:
 
         has_rg = await self._ensure_ripgrep(session)
 
-        search_root = f"{APP_DIR}/{_strip_app_prefix(subpath)}" if subpath else APP_DIR
-        search_root = search_root.rstrip("/")
+        search_root = _resolve_app_path(subpath) if subpath else APP_DIR
+        search_root = search_root.rstrip("/") or APP_DIR
 
         if has_rg:
             cmd_parts = [
@@ -757,6 +788,112 @@ class E2BSandboxManager:
         if not cleaned:
             return f"GLOB '{pattern}': no matches."
         return f"GLOB '{pattern}':\n{cleaned[:4000]}"
+
+    _PLAYWRIGHT_SHOT_SCRIPT = (
+        "import sys\n"
+        "from playwright.sync_api import sync_playwright\n"
+        "url = sys.argv[1]\n"
+        "out = sys.argv[2]\n"
+        "with sync_playwright() as p:\n"
+        "    browser = p.chromium.launch(args=['--no-sandbox'])\n"
+        "    page = browser.new_page(viewport={'width': 1280, 'height': 800})\n"
+        "    page.goto(url, timeout=8000, wait_until='load')\n"
+        "    page.screenshot(path=out)\n"
+        "    browser.close()\n"
+    )
+
+    async def _exec_preview_screenshot(
+        self, session: SandboxSession, project_id: str, params: Dict[str, str],
+    ) -> str:
+        """
+        Launch headless Chromium (Playwright) INSIDE the sandbox, navigate to
+        the dev server, and capture a screenshot. The base64 PNG is stashed on
+        the session (session._last_screenshot_b64) rather than returned inline
+        as text — tool observations are plain text, but a screenshot needs to
+        reach the LLM as an actual image on the NEXT turn. _do_run_agent_turn
+        reads session._last_screenshot_b64 after this tool runs and passes it
+        into the next agent.run(...) call as screenshot_b64=... .
+
+        On any failure (playwright missing because the template hasn't been
+        rebuilt yet, dev server not responding, etc.) this returns a clear
+        plain-text error observation instead of raising.
+        """
+        path = params.get("path", "/").strip() or "/"
+        if not path.startswith("/"):
+            path = "/" + path
+
+        activity_id = self._next_activity_id(project_id)
+        self._emit_activity_start(
+            project_id, activity_id, "screenshot", path, f"Screenshot {path}",
+        )
+
+        url = f"http://localhost:{session.preview_port}{path}"
+        remote_out = "/tmp/gorilla_preview.png"
+        script_path = "/tmp/gorilla_preview_shot.py"
+
+        try:
+            safe_script = self._PLAYWRIGHT_SHOT_SCRIPT.replace("GORILLA_EOF", "GORILLA__EOF")
+            write_result = await asyncio.to_thread(
+                session.sandbox.commands.run,
+                f"cat > '{script_path}' << 'GORILLA_EOF'\n{safe_script}\nGORILLA_EOF",
+                timeout=10,
+            )
+            if write_result.exit_code != 0:
+                self._emit_activity_end(project_id, activity_id, 1)
+                return (
+                    "preview_screenshot failed: could not write screenshot script "
+                    "into the sandbox — the dev server may not be running, or this "
+                    "sandbox template needs a rebuild with playwright installed."
+                )
+
+            run_result = await asyncio.to_thread(
+                session.sandbox.commands.run,
+                f"cd {APP_DIR} && python3 '{script_path}' {shlex.quote(url)} {shlex.quote(remote_out)}",
+                timeout=20,
+            )
+            if run_result.exit_code != 0:
+                stderr = (run_result.stderr or run_result.stdout or "").strip()[:500]
+                self._emit_activity_end(project_id, activity_id, 1)
+                return (
+                    f"preview_screenshot failed: {stderr or 'unknown error'} — "
+                    "the dev server may not be running, or this sandbox template "
+                    "needs a rebuild with playwright installed."
+                )
+
+            sbx = session.sandbox
+            if hasattr(sbx, "files") and hasattr(sbx.files, "read"):
+                raw = await asyncio.to_thread(sbx.files.read, remote_out)
+                if isinstance(raw, str):
+                    raw = raw.encode("latin-1", errors="ignore")
+            else:
+                b64_result = await asyncio.to_thread(
+                    session.sandbox.commands.run,
+                    f"base64 -w0 '{remote_out}'",
+                    timeout=10,
+                )
+                if b64_result.exit_code != 0 or not (b64_result.stdout or "").strip():
+                    self._emit_activity_end(project_id, activity_id, 1)
+                    return (
+                        "preview_screenshot failed: could not read the screenshot "
+                        "back out of the sandbox — the dev server may not be "
+                        "running, or this sandbox template needs a rebuild with "
+                        "playwright installed."
+                    )
+                session._last_screenshot_b64 = (b64_result.stdout or "").strip()
+                self._emit_activity_end(project_id, activity_id, 0)
+                return f"PREVIEW SCREENSHOT of {path}: captured (image attached on next turn)."
+
+            b64 = base64.b64encode(raw).decode("ascii")
+            session._last_screenshot_b64 = b64
+            self._emit_activity_end(project_id, activity_id, 0)
+            return f"PREVIEW SCREENSHOT of {path}: captured (image attached on next turn)."
+        except Exception as e:
+            self._emit_activity_end(project_id, activity_id, 1)
+            return (
+                f"preview_screenshot failed: {e} — the dev server may not be "
+                "running, or this sandbox template needs a rebuild with "
+                "playwright installed."
+            )
 
     async def _exec_web_search(
         self, project_id: str, params: Dict[str, str],
@@ -895,6 +1032,8 @@ class E2BSandboxManager:
                 tasks.append(self._exec_web_search(project_id, params))
             elif tool == "web_fetch":
                 tasks.append(self._exec_web_fetch(project_id, params))
+            elif tool == "preview_screenshot":
+                tasks.append(self._exec_preview_screenshot(session, project_id, params))
             else:
                 tasks.append(asyncio.sleep(0, result=f"[unknown read tool: {tool}]"))
 
@@ -906,6 +1045,150 @@ class E2BSandboxManager:
             else:
                 out_parts.append(str(r))
         return "\n\n".join(out_parts)
+
+    # -----------------------------------------------------------
+    # spawn_subagent — bounded, depth-limited delegation
+    # -----------------------------------------------------------
+    async def _exec_spawn_subagent(
+        self,
+        project_id: str,
+        session: SandboxSession,
+        task: str,
+        max_turns_raw: str,
+    ) -> Tuple[str, int]:
+        """
+        Run a fresh, throwaway LineageAgent against the SAME sandbox/file tree
+        for a bounded number of turns, then collapse everything it did into a
+        short text summary for the parent turn's observation.
+
+        Returns (summary_text, turn_tokens_delta) so the caller can bill the
+        parent turn for the sub-agent's token usage.
+
+        Depth guard: refuses (no-ops with an error string) if this session is
+        already running a sub-agent — spawn_subagent cannot itself be spawned
+        from inside a sub-agent, enforced here at runtime rather than by
+        trying to filter the nested agent's tool list.
+        """
+        if session._in_subagent:
+            return (
+                "spawn_subagent refused: a sub-agent is already running for "
+                "this project. Sub-agents cannot spawn further sub-agents "
+                "(depth limit of 1). Wait for the current one to finish.",
+                0,
+            )
+
+        task = (task or "").strip()
+        if not task:
+            return ("spawn_subagent: no task provided.", 0)
+
+        try:
+            max_turns = int(str(max_turns_raw).strip() or 5)
+        except (TypeError, ValueError):
+            max_turns = 5
+        max_turns = max(1, min(max_turns, 8))
+
+        activity_id = self._next_activity_id(project_id)
+        self._emit_activity_start(
+            project_id, activity_id, "delegate", task[:80],
+            f"Delegating: {task[:60]}",
+        )
+
+        session._in_subagent = True
+        sub_agent = LineageAgent(project_id)
+        turn_tokens_total = 0
+        touched_paths: List[str] = []
+        final_message = ""
+        turns_run = 0
+
+        try:
+            previous_output: Optional[str] = None
+            for turn in range(max_turns):
+                turns_run = turn + 1
+                result = await sub_agent.run(
+                    user_request=task,
+                    file_tree=session._cached_tree if turn == 0 else {},
+                    previous_command_output=previous_output,
+                )
+
+                turn_delta = int(result.get("turn_tokens", 0) or 0)
+                turn_tokens_total += turn_delta
+
+                write_files = result.get("write_files", [])
+                edit_files  = result.get("edit_files",  [])
+                read_calls  = result.get("read_calls",  [])
+                commands    = result.get("commands",    [])
+                parsed_internal = result.get("_parsed", {})
+
+                read_obs = ""
+                if read_calls:
+                    read_obs = await self._execute_read_calls_parallel(project_id, read_calls)
+
+                write_obs_parts: List[str] = []
+                if write_files:
+                    wp, wobs = await self._write_files_parallel(project_id, write_files)
+                    touched_paths.extend(wp)
+                    if wobs:
+                        write_obs_parts.append(wobs)
+                if edit_files:
+                    ep, eobs = await self._apply_edits_parallel(project_id, edit_files)
+                    touched_paths.extend(ep)
+                    if eobs:
+                        write_obs_parts.append(eobs)
+                write_obs = "\n\n".join(write_obs_parts)
+
+                bash_obs = ""
+                if commands:
+                    cmd_results = await self._execute_commands_streaming(project_id, commands)
+                    output_parts: List[str] = []
+                    for r in cmd_results:
+                        stdout    = (r.get("stdout") or "").strip()
+                        stderr    = (r.get("stderr") or "").strip()
+                        exit_code = r.get("exit_code", 0)
+                        if stdout:
+                            output_parts.append(stdout[:2000])
+                        if stderr:
+                            output_parts.append(f"STDERR: {stderr[:1000]}")
+                        if exit_code != 0:
+                            output_parts.append(f"[exit code: {exit_code}]")
+                    bash_obs = "\n".join(output_parts)[:4000] if output_parts else "Command ran successfully with no output."
+
+                if parsed_internal:
+                    sub_agent.record_tool_results(
+                        parsed_internal,
+                        write_observation=write_obs,
+                        read_observation=read_obs,
+                        bash_observation=bash_obs,
+                    )
+
+                msg = result.get("message", "")
+                if msg:
+                    final_message = msg
+
+                if result.get("done", False):
+                    break
+
+                obs_parts = [p for p in (read_obs, write_obs, bash_obs) if p]
+                previous_output = "\n\n".join(obs_parts) if obs_parts else "(no output)"
+
+            session._tree_cached_at = 0.0  # sub-agent may have changed files
+        except Exception as e:
+            log_agent("agent", f"spawn_subagent error: {e}", project_id)
+            final_message = final_message or f"Sub-agent errored: {e}"
+        finally:
+            session._in_subagent = False
+
+        summary_lines = [f"Sub-agent task: {task}"]
+        summary_lines.append(f"Ran {turns_run} turn(s).")
+        if touched_paths:
+            uniq = sorted(set(touched_paths))
+            summary_lines.append(f"Files touched: {', '.join(uniq[:30])}")
+        else:
+            summary_lines.append("No files were changed.")
+        summary_lines.append(f"Sub-agent's final message: {final_message or '(none)'}")
+        summary = "\n".join(summary_lines)
+
+        self._emit_activity_end(project_id, activity_id, 0)
+        return summary, turn_tokens_total
 
     # -----------------------------------------------------------
     # Lifecycle
@@ -1245,7 +1528,7 @@ class E2BSandboxManager:
         self, project_id, user_request, user_id, env_vars,
         chat_history=None, gorilla_proxy_url="", has_supabase=False,
         is_debug=False, error_context="", image_b64=None,
-        on_assistant_message=None, agent_skills=None
+        on_assistant_message=None, agent_skills=None, think_mode="normal"
     ) -> Dict[str, Any]:
         self._turn_locks.setdefault(project_id, asyncio.Lock())
         async with self._turn_locks[project_id]:
@@ -1253,13 +1536,14 @@ class E2BSandboxManager:
                 project_id, user_request, user_id, env_vars,
                 chat_history, gorilla_proxy_url, has_supabase,
                 is_debug, error_context, image_b64, on_assistant_message,
-                agent_skills
+                agent_skills, think_mode,
             )
 
     async def _do_run_agent_turn(
         self, project_id, user_request, user_id, env_vars,
         chat_history, gorilla_proxy_url, has_supabase, is_debug,
         error_context, image_b64, on_assistant_message, agent_skills=None,
+        think_mode="normal",
     ) -> Dict[str, Any]:
         try:
             session = await self.ensure_running(project_id, env_vars, user_id)
@@ -1287,6 +1571,9 @@ class E2BSandboxManager:
         agent_marked_done         = False
         consecutive_no_action     = 0
         CIRCUIT_BREAKER_LIMIT     = 4
+        # Base64 screenshot captured by preview_screenshot this turn, if any —
+        # threaded into the NEXT agent.run() call so the vision model can see it.
+        screenshot_b64_for_next_turn: Optional[str] = None
 
         now = time.time()
         if (now - session._tree_cached_at) > 30 or not session._cached_tree:
@@ -1309,7 +1596,10 @@ class E2BSandboxManager:
                 image_b64=image_b64 if turn == 0 else None,
                 previous_command_output=previous_output,
                 agent_skills=agent_skills if turn == 0 else None,
+                think_mode=think_mode,
+                screenshot_b64=screenshot_b64_for_next_turn,
             )
+            screenshot_b64_for_next_turn = None
 
             # ─── BILLING FIX: use turn_tokens delta directly ─────────────
             turn_delta, total_tokens = self._extract_turn_tokens(result, total_tokens)
@@ -1376,12 +1666,44 @@ class E2BSandboxManager:
             commands:    List[str]            = result.get("commands", [])
             parsed_internal                   = result.get("_parsed", {})
 
+            # ── Phase 0: spawn_subagent (must run ALONE — enforced by the
+            #    prompt's batching rules, but we handle it defensively even
+            #    if other calls slip in on the same turn) ──────────────────
+            subagent_req = result.get("spawn_subagent")
+            if subagent_req:
+                all_commands.append(f"spawn_subagent:{subagent_req.get('task','')[:80]}")
+                sub_summary, sub_turn_tokens = await self._exec_spawn_subagent(
+                    project_id, session,
+                    subagent_req.get("task", ""),
+                    subagent_req.get("max_turns", ""),
+                )
+                if sub_turn_tokens > 0:
+                    try:
+                        self._add_tokens(session.owner_id, sub_turn_tokens)
+                        self._emit(project_id, {"type": "token_usage", "tokens": sub_turn_tokens})
+                        total_tokens += sub_turn_tokens
+                    except Exception:
+                        pass
+                if parsed_internal:
+                    agent.record_tool_results(
+                        parsed_internal,
+                        write_observation="",
+                        read_observation=sub_summary,
+                        bash_observation="",
+                    )
+                previous_output = sub_summary
+                consecutive_no_action = 0
+                continue
+
             # ── Phase 1: parallel reads ───────────────────────────────────
             read_obs = ""
             if read_calls:
                 for c in read_calls:
                     all_commands.append(f"{c.get('tool','read')}:{json.dumps(c.get('params',{}))[:80]}")
                 read_obs = await self._execute_read_calls_parallel(project_id, read_calls)
+                if session._last_screenshot_b64:
+                    screenshot_b64_for_next_turn = session._last_screenshot_b64
+                    session._last_screenshot_b64 = None
 
             # ── Phase 2: parallel writes ──────────────────────────────────
             write_obs_parts: List[str] = []
@@ -2091,16 +2413,19 @@ class E2BSandboxManager:
             await asyncio.to_thread(session.sandbox.commands.run,
                 "pkill -f vite || true; pkill -f 'npm run dev' || true; pkill -f 'node server' || true")
             await asyncio.sleep(1)
-        except Exception:
-            pass
+        except Exception as e:
+            self._emit_log(project_id, "system", f"Dev server restart (kill step) failed: {e}")
 
         try:
             await asyncio.to_thread(session.sandbox.commands.run,
                 f"cd {APP_DIR} && nohup npm run dev > /tmp/dev.log 2>&1 &")
-        except Exception:
-            pass
+        except Exception as e:
+            self._emit_log(project_id, "system", f"Dev server restart (spawn step) failed: {e}")
 
         fe_ok, api_ok, _ = await self._fast_verify_dev_server(project_id, session)
+        session._dev_server_up = bool(fe_ok or api_ok)
+        if not session._dev_server_up:
+            self._emit_log(project_id, "system", "Dev server did not come back up after restart.")
 
         self._emit(project_id, {"type": "sandbox_url", "url": session.url})
         return (session.url, None)
@@ -2122,20 +2447,25 @@ class E2BSandboxManager:
                 session.last_activity   = time.time()
             return ok
         except Exception as e:
-            print(f"⚠️ write_file failed: {e}")
+            self._emit_log(project_id, "system", f"Write failed for {rel_path}: {e}")
             return False
 
     async def delete_file(self, project_id: str, rel_path: str) -> bool:
         session = self._sessions.get(project_id)
         if not session:
             return False
+        full = _resolve_app_path(rel_path)
+        if full == APP_DIR:
+            # Refuse to no-op-delete the app root itself.
+            return False
         try:
-            await asyncio.to_thread(session.sandbox.commands.run, f"rm -f '{APP_DIR}/{rel_path}'")
+            await asyncio.to_thread(session.sandbox.commands.run, f"rm -f '{full}'")
             session.content_hashes.pop(rel_path, None)
             session._tree_cached_at = 0.0
             session.last_activity   = time.time()
             return True
-        except Exception:
+        except Exception as e:
+            self._emit_log(project_id, "system", f"Delete failed for {rel_path}: {e}")
             return False
 
     # -----------------------------------------------------------

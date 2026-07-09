@@ -11,7 +11,7 @@
   
 </pre>
 
-**The Autonomous Multi-Agent Orchestration Engine for Full-Stack SaaS.**
+**An AI coding agent that builds, previews, and deploys full-stack apps from a chat prompt. Built for Indies.**
 
 [![SPONSORED BY E2B FOR STARTUPS](https://img.shields.io/badge/SPONSORED%20BY-E2B%20FOR%20STARTUPS-ff8800?style=for-the-badge)](https://e2b.dev/startups)
 [![Discord](https://img.shields.io/badge/Discord-Join_the_Beta-7289da?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/V3f3PkwQbY)
@@ -23,24 +23,37 @@
 
 ---
 
-## 🦍 Stop Building Wrappers. Build Engines.
+## What it is
 
-The current "VybeCoding" ecosystem is a trap. AI tools generate decent React UIs but leave developers completely stranded when it comes to configuring databases, cloud secrets, authentication, and deployment pipelines. 
+**Gorilla Builder** takes a prompt (or a Figma/Miro import) and drives an agent loop — plan, write/edit files, run commands, verify the dev server, repeat — inside an isolated [E2B](https://e2b.dev) sandbox, streaming every step back to the browser in real time. The result is a working React/Node app you can preview live, edit by hand, and push to GitHub or Vercel.
 
-**Gorilla Builder** is an open-source, 22,000-line multi-agent orchestration engine. It doesn't just generate code snippets; it autonomously generates, syncs, and deploys production-ready React and Node.js applications while completely eliminating backend boilerplate.
+It's a FastAPI backend (`app.py`, `backend/`) driving a Python agent (`backend/ai/lineage_agent.py`) that operates on sandboxed containers (`backend/e2b_sandbox.py`), paired with a server-rendered frontend (`frontend/`) using SSE for live progress.
 
-We built this so you can launch a production-ready SaaS with **zero API keys or cloud secrets required**.
+## How the agent loop works
 
-## ⚡ The Technical Moat
+* **Plan → code → verify.** The agent (`lineage_agent.py`) expands the prompt into a plan, emits tool calls (`write_file`, `edit_file`, `read_files`, `grep_search`, `run_bash`, ...), and the sandbox manager (`e2b_sandbox.py`) executes them against a live container.
+* **Sandboxed execution.** Every project runs in its own E2B sandbox — file writes, shell commands, and the dev server are fully isolated per project, with paths strictly confined to the project root.
+* **Live tool-call visibility.** The frontend renders each tool call as an expandable activity card (running → done/failed) as it happens, not just a final "done" message — plus syntax-highlighted, copyable code blocks in the chat itself.
+* **Self-healing dev server.** Before the agent can mark a task done, it verifies the dev server is actually responding; restart loops are blocked in favor of fixing the underlying error.
+* **Structured providers.** Optional Supabase auth/database provisioning and Figma/Miro import are handled as first-class tool integrations, not bolted-on scripts.
 
-Gorilla Builder is not a thin wrapper over the OpenAI API. It is a distributed infrastructure engine.
+## Status
 
-* **Unified AI & Auth Gateway:** A provider-agnostic edge layer that natively injects live OAuth (Google Sign-In) and AI capabilities (Chat, Image Gen) directly into the generated app. 
-* **Browser-Native Execution (WebContainers):** We run a live, headless Node.js environment directly inside the user's browser. This handles real-time dependency resolution and file-system operations with zero server-side overhead or Docker orchestration.
-* **Swarm Choreography (MCP):** Powered by the Model Context Protocol, Gorilla Builder uses a swarm of specialized Python agents (`Planner` -> `Coder` -> `Reviewer`). They operate in isolated contexts, passing structured JSON states to prevent hallucination cascades.
-* **AST Metaprogramming:** Instead of blindly rewriting entire files, our agents utilize Abstract Syntax Tree (AST) parsing to autonomously traverse, mutate, and inject code deep into existing directories without breaking syntactic validity.
-* **Zero-Config CI/CD:** Native integrations with GitHub and Vercel. Go from a text prompt (or a Figma URL) to a live, deployed SaaS URL in one click.
+This is an active work-in-progress, not a polished 1.0. Expect rough edges. Recent hardening work has focused on:
 
+* Confining all agent file I/O (read/write/list/grep/delete) to the project sandbox root, closing several path-traversal edge cases.
+* Making sandbox/dev-server failures surface to the user instead of failing silently.
+* Preventing duplicate concurrent agent runs against the same project/sandbox.
+* Modernizing the chat UI (markdown rendering, syntax-highlighted code blocks with copy buttons, tool-call activity cards) and removing dead/duplicated frontend dependencies.
+
+## Running it locally
+
+The app expects ~25 environment variables (Supabase, E2B, OAuth providers, OpenRouter/model keys, etc. — see `backend/settings.py`). There's no local "just works" mode yet; you need real credentials for Supabase and E2B at minimum to boot a project.
+
+```bash
+pip install -r requirements.txt
+uvicorn app:app --reload
+```
 
 ## 🤝 Join the Swarm (Private Beta)
 

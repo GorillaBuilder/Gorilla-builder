@@ -140,11 +140,10 @@ _sandbox_manager = None  # ← ADD THIS LINE
 _SANDBOX_BOOT_LOCKS: Dict[str, asyncio.Lock] = {}
 
 def _sandbox_boot_lock(project_id: str) -> asyncio.Lock:
-    lock = _SANDBOX_BOOT_LOCKS.get(project_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _SANDBOX_BOOT_LOCKS[project_id] = lock
-    return lock
+    # Safe under asyncio's single-threaded event loop: this function has no
+    # `await` between the get and the set, so no other coroutine can run in
+    # between and create a second lock for the same project_id.
+    return _SANDBOX_BOOT_LOCKS.setdefault(project_id, asyncio.Lock())
 
 # ==========================================================================
 # APP INITIALIZATION & LIFECYCLE
@@ -535,61 +534,6 @@ FIGMA_CLIENT_SECRET = os.getenv("FIGMA_CLIENT_SECRET")
 # e.g., https://app.gorillabuilder.dev/auth/figma/callback (must match Figma exact)
 FIGMA_REDIRECT_URI = os.getenv("FIGMA_REDIRECT_URI")
 
-@app.get("/auth/figma")
-async def figma_login(request: Request):
-    """Initiates the Figma OAuth flow."""
-    user = get_current_user(request) 
-    
-    state = secrets.token_urlsafe(16)
-    request.session["figma_oauth_state"] = state
-    
-    # 🛑 THE FIX: Changed scope=file_read to scope=file_content:read
-    url = f"https://www.figma.com/oauth?client_id={FIGMA_CLIENT_ID}&redirect_uri={urllib.parse.quote(FIGMA_REDIRECT_URI)}&scope=file_content:read&state={state}&response_type=code"
-    
-    return RedirectResponse(url)
-
-@app.get("/auth/figma/callback")
-async def figma_callback(request: Request, code: str, state: str):
-    """Catches the code from Figma, trades it for a token, and saves it to DB."""
-    try:
-        user = get_current_user(request)
-        
-        # Verify the state matches what we sent (CSRF protection)
-        saved_state = request.session.pop("figma_oauth_state", None)
-        if not saved_state or state != saved_state:
-            return RedirectResponse("/dashboard?error=figma_invalid_state", status_code=303)
-        
-        # 🛑 THE FIX: Changed from www.figma.com to api.figma.com/v1/
-        async with httpx.AsyncClient() as client:
-            res = await client.post("https://api.figma.com/v1/oauth/token", data={
-                "client_id": FIGMA_CLIENT_ID,
-                "client_secret": FIGMA_CLIENT_SECRET,
-                "redirect_uri": FIGMA_REDIRECT_URI,
-                "code": code,
-                "grant_type": "authorization_code"
-            })
-            
-            if res.status_code != 200:
-                print(f"⚠️ Figma OAuth Error: {res.text}")
-                return RedirectResponse("/dashboard?error=figma_token_exchange_failed", status_code=303)
-                
-            tokens = res.json()
-            access_token = tokens.get("access_token")
-            refresh_token = tokens.get("refresh_token")
-            
-            if access_token:
-                # Save the tokens to the user's record in Supabase
-                supabase.table("users").update({
-                    "figma_access_token": access_token,
-                    "figma_refresh_token": refresh_token
-                }).eq("id", user["id"]).execute()
-                
-        return RedirectResponse("/dashboard?success=figma_linked", status_code=303)
-        
-    except Exception as e:
-        print(f"⚠️ Figma Auth Callback crashed: {e}")
-        return RedirectResponse("/dashboard?error=figma_auth_crash", status_code=303)
-
 # ==========================================================================
 # PUBLIC ROUTES (Templates & Redirects)
 # ==========================================================================
@@ -653,19 +597,19 @@ async def favicon():
 @app.get("/docs/{page}", response_class=HTMLResponse)
 async def docs_page(request: Request, page: str):
     
-    # The complete 42-page Gor://a Builder Master Architecture
+    # The complete 44-page Gor://a Builder Master Architecture
     valid_pages = [
         # Part 1: Getting Started
         "intro", "quickstart", "dashboard", "tiers", "account-settings",
-        
+
         # Part 2: Agent Skills
         "skills-overview", "visual-prefs", "ui-frameworks", "code-style", "agent-personality", "golden-rules",
-        
+
         # Part 3: Designing & Prompting
-        "perfect-prompt", "image-references", "figma-overview", "figma-import", "ideas-chips",
-        
+        "perfect-prompt", "image-references", "figma-overview", "figma-import", "github-import", "ideas-chips",
+
         # Part 4: In-Browser IDE
-        "editor-interface", "webcontainers", "auto-healing", "manual-editing", "file-tree", "export-zip",
+        "editor-interface", "webcontainers", "auto-healing", "sub-agents", "manual-editing", "file-tree", "export-zip",
         
         # Part 5: Full-Stack & Databases
         "backend-overview", "supabase-link", "db-provisioning", "sql-migrations", "db-healing",
@@ -766,772 +710,6 @@ def _ensure_gorilla_api_key(user_id: str):
 # 1. SIGNUP FLOW (Secure)
 # --------------------------------------------------------------------------
 
-@app.post("/auth/signup")
-async def auth_signup_init(
-    request: Request, 
-    background_tasks: BackgroundTasks,
-    email: str = Form(...), 
-    password: str = Form(...)
-):
-    email = (email or "").strip().lower()
-    
-    # [SECURITY] Check if user already exists
-    try:
-        # Admin check is most reliable. If not available, use a safe alternative.
-        existing_users = supabase.auth.admin.list_users()
-        user_exists = any(u.email == email for u in existing_users)
-        
-        if user_exists:
-            # REDIRECT TO LOGIN if account exists
-            return templates.TemplateResponse(
-                "auth/login.html", 
-                {
-                    "request": request, 
-                    "error": "Account exists. Please log in here.",
-                    "email_prefill": email # Optional: pass back to template if supported
-                }
-            )
-    except Exception as e:
-        print(f"⚠️ User existence check warning: {e}")
-        pass # Fail open or closed depending on policy, passing allows flow to continue
-
-    # Proceed with OTP generation
-    otp = "".join(random.choices(string.digits, k=6))
-    
-    PENDING_SIGNUPS[email] = {
-        "password": password,
-        "otp": otp,
-        "ts": time.time()
-    }
-    
-    # --- FIX: SEND ACTUAL EMAIL VIA BACKGROUND TASK ---
-    background_tasks.add_task(send_otp_email, email, otp)
-    
-    return templates.TemplateResponse(
-        "auth/signup.html", 
-        {
-            "request": request, 
-            "step": "verify", 
-            "email": email
-        }
-    )
-
-@app.post("/auth/verify")
-async def auth_verify_otp(
-    request: Request,
-    email: str = Form(...),
-    code: str = Form(...)
-):
-    email  = email.strip().lower()
-    record = PENDING_SIGNUPS.get(email)
- 
-    if not record:
-        return templates.TemplateResponse("auth/signup.html", {
-            "request": request, "step": "initial",
-            "error": "Session expired. Please start over."
-        })
- 
-    # ✅ Expire after 10 minutes
-    if time.time() - record.get("ts", 0) > 600:
-        del PENDING_SIGNUPS[email]
-        return templates.TemplateResponse("auth/signup.html", {
-            "request": request, "step": "initial",
-            "error": "Code expired. Please start over."
-        })
- 
-    # ✅ Max 5 attempts
-    record["attempts"] = record.get("attempts", 0) + 1
-    if record["attempts"] > 5:
-        del PENDING_SIGNUPS[email]
-        return templates.TemplateResponse("auth/signup.html", {
-            "request": request, "step": "initial",
-            "error": "Too many attempts. Please start over."
-        })
- 
-    if record["otp"] != code:
-        remaining = max(0, 5 - record["attempts"])
-        return templates.TemplateResponse("auth/signup.html", {
-            "request": request, "step": "verify", "email": email,
-            "error": f"Invalid code. {remaining} attempt{'s' if remaining != 1 else ''} remaining."
-        })
- 
-    try:
-        password = record["password"]
- 
-        try:
-            supabase.auth.admin.create_user({
-                "email": email,
-                "password": password,
-                "email_confirm": True
-            })
-        except Exception:
-            return templates.TemplateResponse("auth/login.html", {
-                "request": request,
-                "error": "Account exists. Please log in."
-            })
- 
-        res = supabase.auth.sign_in_with_password({"email": email, "password": password})
-        if not res.session:
-            raise Exception("Account created, but auto-login failed.")
- 
-        ensure_public_user(res.user.id, email)
-        _ensure_gorilla_api_key(res.user.id)
- 
-        if email in PENDING_SIGNUPS:
-            del PENDING_SIGNUPS[email]
- 
-        request.session["user"] = {"id": res.user.id, "email": email}
-        response = RedirectResponse("/dashboard", status_code=303)
-        response.set_cookie(
-            key="sb_access_token",
-            value=res.session.access_token,
-            max_age=86400, httponly=True, samesite="lax"
-        )
-        return response
- 
-    except Exception as e:
-        print(f"Verify Error: {e}")
-        return templates.TemplateResponse("auth/signup.html", {
-            "request": request, "step": "verify", "email": email,
-            "error": "System error. Try again."
-        })
-
-# --------------------------------------------------------------------------
-# 2. LOGIN FLOW (Smart Redirect)
-# --------------------------------------------------------------------------
-
-@app.post("/auth/login")
-async def login(request: Request, email: str = Form(...), password: str = Form(...)):
-    try:
-        # 1. Attempt Real Authentication against Supabase
-        res = supabase.auth.sign_in_with_password({
-            "email": email, 
-            "password": password
-        })
-        
-        # If we get here, the password IS correct.
-        if not res.session:
-            raise Exception("Auth failed (No session)")
-
-        # FIX: Force session set to avoid dev@local fallback
-        request.session["user"] = {"id": res.user.id, "email": email}
-        # FIX: Ensure user is synced
-        ensure_public_user(res.user.id, email)
-        
-        # 🚨 AI PROXY: Ensure they have a Master Key
-        _ensure_gorilla_api_key(res.user.id)
-
-        # 2. Success: Set Cookie & Redirect
-        response = RedirectResponse("/dashboard", status_code=303)
-        response.set_cookie(
-            key="sb_access_token", 
-            value=res.session.access_token, 
-            max_age=86400, 
-            httponly=True, 
-            samesite="lax"
-        )
-        return response
-
-    except Exception as e:
-        print(f"❌ Login Failed for {email}: {e}")
-        
-        # 3. Security Analysis: Determine why it failed
-        error_msg = "Invalid email or password."
-        
-        try:
-            # Check if user exists but uses Google/GitHub Auth (Passwordless)
-            users = supabase.auth.admin.list_users()
-            target_user = next((u for u in users if u.email == email), None)
-            
-            if target_user:
-                identities = getattr(target_user, "identities", [])
-                providers = [i.provider for i in identities]
-                
-                # If they only have OAuth and no password set
-                if "google" in providers and "email" not in providers:
-                    error_msg = "This account uses Google Login. Please click 'Continue with Google'."
-                elif "github" in providers and "email" not in providers:
-                    error_msg = "This account uses GitHub Login. Please click 'Continue with GitHub'."
-                elif "google" in providers or "github" in providers:
-                    error_msg = "Invalid password. Try logging in with your connected OAuth provider."
-        except:
-            pass # Keep generic error if admin check fails
-
-        # 4. STRICT FAILURE: Return to login page with error
-        return templates.TemplateResponse("auth/login.html", {
-            "request": request, 
-            "error": error_msg,
-            "email_prefill": email
-        })
-
-@app.get("/auth/logout")
-async def logout(request: Request):
-    # Redirect to signup on logout
-    response = RedirectResponse("/signup", status_code=303)
-    response.delete_cookie("sb_access_token")
-    request.session.clear()
-    try:
-        supabase.auth.sign_out()
-    except: pass
-    return response
-
-# --------------------------------------------------------------------------
-# 3. FORGOT PASSWORD
-# --------------------------------------------------------------------------
-
-@app.post("/auth/forgot-password")
-async def forgot_password_action(request: Request, email: str = Form(...)):
-    try:
-        supabase.auth.reset_password_email(email, options={
-            "redirect_to": f"{str(request.base_url).rstrip('/')}/auth/reset-callback" 
-        })
-        return templates.TemplateResponse("auth/login.html", {
-            "request": request, 
-            "error": "Reset link sent. Check your email."
-        })
-    except Exception as e:
-        return templates.TemplateResponse("auth/forgot_password.html", {"request": request, "error": f"Error: {e}"})
-
-# --------------------------------------------------------------------------
-# 4. GOOGLE OAUTH
-# --------------------------------------------------------------------------
-
-@app.get("/auth/google")
-async def auth_google(request: Request):
-    if not GOOGLE_CLIENT_ID or not GOOGLE_REDIRECT_URI:
-        raise HTTPException(500, "Google Auth config missing.")
-    scope = "openid email profile"
-    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?response_type=code&client_id={GOOGLE_CLIENT_ID}&redirect_uri={GOOGLE_REDIRECT_URI}&scope={scope}"
-    return RedirectResponse(auth_url)
-
-@app.get("/auth/google/callback")
-async def auth_google_callback(request: Request, code: str):
-    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-        raise HTTPException(500, "Google Auth config missing.")
-    
-    async with httpx.AsyncClient() as client:
-        res = await client.post("https://oauth2.googleapis.com/token", data={
-            "code": code,
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "redirect_uri": GOOGLE_REDIRECT_URI,
-            "grant_type": "authorization_code",
-        })
-        
-        if res.status_code != 200:
-             raise HTTPException(400, "Google Login Failed")
-        
-        tokens = res.json()
-        access_token = tokens.get("access_token")
-        
-        user_res = await client.get(
-            "https://www.googleapis.com/oauth2/v1/userinfo", 
-            headers={"Authorization": f"Bearer {access_token}"}
-        )
-        user_data = user_res.json()
-        email = user_data.get("email")
-        
-        if not email:
-            raise HTTPException(400, "No email from Google")
-
-        user_id = _stable_user_id_for_email(email)
-        ensure_public_user(user_id, email)
-        
-        # 🚨 AI PROXY: Ensure they have a Master Key
-        _ensure_gorilla_api_key(user_id)
-        
-        request.session["user"] = {"id": user_id, "email": email}
-        
-        return RedirectResponse("/dashboard", status_code=303)
-
-# --------------------------------------------------------------------------
-# 5. GITHUB OAUTH (Crucial for Vercel Deployment pipeline)
-# --------------------------------------------------------------------------
-
-@app.get("/auth/github")
-async def auth_github(request: Request):
-    if not GITHUB_CLIENT_ID or not GITHUB_REDIRECT_URI:
-        raise HTTPException(500, "GitHub Auth config missing.")
-    
-    # Scope 'repo' is REQUIRED to push code on the user's behalf
-    scope = "user:email repo"
-    auth_url = f"https://github.com/login/oauth/authorize?client_id={GITHUB_CLIENT_ID}&redirect_uri={GITHUB_REDIRECT_URI}&scope={scope}"
-    return RedirectResponse(auth_url)
-
-@app.get("/auth/github/callback")
-async def auth_github_callback(request: Request, code: str):
-    if not GITHUB_CLIENT_ID or not GITHUB_CLIENT_SECRET:
-        raise HTTPException(500, "GitHub Auth config missing.")
-    
-    async with httpx.AsyncClient() as client:
-        # 1. Exchange code for GitHub Access Token
-        res = await client.post(
-            "https://github.com/login/oauth/access_token", 
-            data={
-                "client_id": GITHUB_CLIENT_ID,
-                "client_secret": GITHUB_CLIENT_SECRET,
-                "code": code,
-                "redirect_uri": GITHUB_REDIRECT_URI
-            },
-            headers={"Accept": "application/json"}
-        )
-        
-        if res.status_code != 200:
-            raise HTTPException(400, "GitHub Login Failed")
-        
-        tokens = res.json()
-        access_token = tokens.get("access_token")
-        
-        if not access_token:
-            error_msg = tokens.get("error_description", "Failed to retrieve GitHub access token")
-            raise HTTPException(400, error_msg)
-
-        # 2. Get User Profile Data
-        user_res = await client.get(
-            "https://api.github.com/user", 
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Accept": "application/vnd.github.v3+json"
-            }
-        )
-        user_data = user_res.json()
-        github_username = user_data.get("login", "unknown_github_user")
-
-        # (email resolution logic unchanged — steps 3 & 4 from your original)
-        email = user_data.get("email")
-        if not email:
-            emails_res = await client.get(
-                "https://api.github.com/user/emails",
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Accept": "application/vnd.github.v3+json"
-                }
-            )
-            if emails_res.status_code == 200:
-                emails_data = emails_res.json()
-                if isinstance(emails_data, list):
-                    for em in emails_data:
-                        if isinstance(em, dict) and em.get("primary") and em.get("verified"):
-                            email = em.get("email")
-                            break
-                    if not email:
-                        for em in emails_data:
-                            if isinstance(em, dict) and em.get("verified"):
-                                email = em.get("email")
-                                break
-                    if not email and len(emails_data) > 0 and isinstance(emails_data[0], dict):
-                        email = emails_data[0].get("email")
-
-        if not email:
-            email = f"{github_username}@noreply.github.com"
-
-        # ── ACCOUNT LINKING ──────────────────────────────────────────────
-        # If the user is already logged in (e.g. via Google), attach the
-        # GitHub token to their existing account instead of making a new one.
-        existing_session = request.session.get("user")
-        if existing_session and existing_session.get("id"):
-            user_id = existing_session["id"]
-            # Don't overwrite their session email — keep the Google one.
-        else:
-            # Fresh login via GitHub: resolve by GitHub email as before.
-            user_id = _stable_user_id_for_email(email)
-            ensure_public_user(user_id, email)
-            _ensure_gorilla_api_key(user_id)
-            request.session["user"] = {"id": user_id, "email": email}
-        # ─────────────────────────────────────────────────────────────────
-
-        # 5. Save the GitHub access token under whichever user_id we resolved
-        try:
-            supabase.table("users").update(
-                {"github_access_token": access_token}
-            ).eq("id", user_id).execute()
-        except Exception as e:
-            print(f"⚠️ Failed to save github_access_token for user {user_id}: {e}")
-
-        is_popup = request.session.pop("github_oauth_popup", False)
-        if is_popup:
-            return HTMLResponse("""<!DOCTYPE html><html><head><title>Connected</title></head>
-        <body><script>
-        window.opener && window.opener.postMessage({type:'github_linked',ok:true},'*');
-        window.close();
-        </script><p>GitHub connected. You can close this window.</p></body></html>""")
-        return RedirectResponse("/dashboard", status_code=303)        
-
-# ==========================================================================
-# BILLING ROUTES (Mock Payment Processing)
-# ==========================================================================
-@app.post("/billing/process-premium")
-async def process_premium(request: Request):
-    """Simulate upgrading to Premium (5M tokens/mo)."""
-    user = get_current_user(request)
-    
-    # Update Plan to premium and set limit to 5,000,000
-    set_user_plan_and_limit(user["id"], "premium", 5000000)
-    
-    # Redirect to dashboard with success param?
-    return RedirectResponse("/dashboard", status_code=303)
-
-@app.post("/billing/process-tokens")
-async def process_tokens(request: Request, amount: int = Form(...)):
-    """Simulate buying one-time token top-up."""
-    user = get_current_user(request)
-    
-    # "Top up" logic: We decrease 'tokens_used' by the purchased amount
-    decrease_tokens_used(user["id"], amount)
-    
-    return RedirectResponse("/dashboard", status_code=303)
-from fastapi.responses import HTMLResponse, JSONResponse
-
-@app.get("/pricing", response_class=HTMLResponse)
-async def pricing_page(request: Request):
-    user = get_current_user_safe(request)
-    db_user = None
-    if user:
-        db_user = db_select_one("users", {"id": user["id"]}, "plan, first_month_price")
-    return templates.TemplateResponse("freemium/pricing.html", {
-        "request": request,
-        "user": user,
-        "db_user": db_user,
-    })
-# ==========================================================================
-# SUPABASE MANAGEMENT OAUTH (Phase 1)
-# ==========================================================================
-SUPABASE_MGMT_CLIENT_ID = os.getenv("SUPABASE_MGMT_CLIENT_ID")
-SUPABASE_MGMT_CLIENT_SECRET = os.getenv("SUPABASE_MGMT_CLIENT_SECRET")
-SUPABASE_MGMT_REDIRECT_URI = os.getenv("SUPABASE_MGMT_REDIRECT_URI")
-
-@app.get("/auth/supabase/link")
-async def link_supabase_account(request: Request):
-    """Initiates the Supabase Management API OAuth flow."""
-    user = get_current_user(request)
-    if not SUPABASE_MGMT_CLIENT_ID or not SUPABASE_MGMT_REDIRECT_URI:
-        raise HTTPException(500, "Supabase Management Auth config missing.")
-    
-    state = secrets.token_urlsafe(16)
-    request.session["supabase_oauth_state"] = state
-    
-    # Send them to Supabase to authorize Gorilla Builder
-    auth_url = f"https://api.supabase.com/v1/oauth/authorize?client_id={SUPABASE_MGMT_CLIENT_ID}&response_type=code&redirect_uri={urllib.parse.quote(SUPABASE_MGMT_REDIRECT_URI)}&state={state}"
-    return RedirectResponse(auth_url)
-
-@app.get("/auth/supabase/callback")
-async def auth_supabase_callback(request: Request, code: str, state: str):
-    """Exchanges the auth code for Management Tokens and saves them to the DB."""
-    try:
-        user = get_current_user(request)
-        saved_state = request.session.pop("supabase_oauth_state", None)
-        
-        if not saved_state or state != saved_state:
-            return RedirectResponse("/dashboard?error=supabase_invalid_state", status_code=303)
-            
-        async with httpx.AsyncClient() as client:
-            res = await client.post(
-                "https://api.supabase.com/v1/oauth/token",
-                data={
-                    "client_id": SUPABASE_MGMT_CLIENT_ID,
-                    "client_secret": SUPABASE_MGMT_CLIENT_SECRET,
-                    "code": code,
-                    "grant_type": "authorization_code",
-                    "redirect_uri": SUPABASE_MGMT_REDIRECT_URI
-                },
-                headers={"Accept": "application/json"}
-            )
-            
-            # 🛑 THE FIX: Allow 201 Created in addition to 200 OK
-            if res.status_code not in [200, 201]:
-                print(f"⚠️ Supabase OAuth Error ({res.status_code}): {res.text}")
-                return RedirectResponse("/dashboard?error=supabase_token_exchange_failed", status_code=303)
-                
-            tokens = res.json()
-            access_token = tokens.get("access_token")
-            refresh_token = tokens.get("refresh_token")
-            
-            if access_token:
-                # Save the management tokens directly to the user's profile
-                supabase.table("users").update({
-                    "supabase_access_token": access_token,
-                    "supabase_refresh_token": refresh_token
-                }).eq("id", user["id"]).execute()
-                print(f"✅ Supabase tokens successfully saved for user {user['id']}")
-                
-        # Replace only the final return in auth_supabase_callback:
-        is_popup = request.session.pop("supabase_oauth_popup", False)
-        if is_popup:
-            return HTMLResponse("""<!DOCTYPE html><html><head><title>Connected</title></head>
-        <body><script>
-        window.opener && window.opener.postMessage({type:'supabase_linked',ok:true},'*');
-        window.close();
-        </script><p>Supabase connected. You can close this window.</p></body></html>""")
-        return RedirectResponse("/dashboard?success=supabase_linked", status_code=303)
-
-    except Exception as e:
-        print(f"⚠️ Supabase Auth Callback crashed: {e}")
-        return RedirectResponse("/dashboard?error=supabase_auth_crash", status_code=303)
-
-# ==========================================================================
-# PopUp Oauth
-# ==========================================================================
-
-@app.get("/auth/supabase/link-popup")
-async def link_supabase_popup(request: Request):
-    user = get_current_user(request)
-    
-    # If already linked, close the popup immediately
-    user_data = db_select_one("users", {"id": user["id"]}, "supabase_access_token")
-    if user_data and user_data.get("supabase_access_token"):
-        return HTMLResponse("""<!DOCTYPE html><html><body><script>
-window.opener && window.opener.postMessage({type:'supabase_linked',ok:true},'*');
-window.close();
-</script><p>Already connected.</p></body></html>""")
-    
-    if not SUPABASE_MGMT_CLIENT_ID or not SUPABASE_MGMT_REDIRECT_URI:
-        raise HTTPException(500, "Supabase Management Auth config missing.")
-    state = secrets.token_urlsafe(16)
-    request.session["supabase_oauth_state"] = state
-    request.session["supabase_oauth_popup"] = True
-    auth_url = (
-        f"https://api.supabase.com/v1/oauth/authorize"
-        f"?client_id={SUPABASE_MGMT_CLIENT_ID}"
-        f"&response_type=code"
-        f"&redirect_uri={urllib.parse.quote(SUPABASE_MGMT_REDIRECT_URI)}"
-        f"&state={state}"
-    )
-    return RedirectResponse(auth_url)
-
-
-@app.get("/auth/github/link-popup")
-async def link_github_popup(request: Request):
-    user = get_current_user(request)
-    
-    # If already linked, close the popup immediately
-    user_data = db_select_one("users", {"id": user["id"]}, "github_access_token")
-    if user_data and user_data.get("github_access_token"):
-        return HTMLResponse("""<!DOCTYPE html><html><body><script>
-window.opener && window.opener.postMessage({type:'github_linked',ok:true},'*');
-window.close();
-</script><p>Already connected.</p></body></html>""")
-    
-    if not GITHUB_CLIENT_ID or not GITHUB_REDIRECT_URI:
-        raise HTTPException(500, "GitHub Auth config missing.")
-    request.session["github_oauth_popup"] = True
-    scope = "user:email repo"
-    auth_url = (
-        f"https://github.com/login/oauth/authorize"
-        f"?client_id={GITHUB_CLIENT_ID}"
-        f"&redirect_uri={urllib.parse.quote(GITHUB_REDIRECT_URI)}"
-        f"&scope={scope}"
-        f"&state=link_{user['id']}"
-    )
-    return RedirectResponse(auth_url)
-
-# ==========================================================================
-# DASHBOARD & WORKSPACE
-# ==========================================================================
-import random
-from datetime import datetime, timezone
-from fastapi import Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
-
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(request: Request):
-    user = get_current_user(request)
-    
-    # Fetch latest Plan, Agent Skills, and Last Spin Date from DB
-    has_skills = False
-    last_spin_date = None
-    try:
-        res = supabase.table("users").select("plan, agent_skills, last_spin_date").eq("id", user["id"]).single().execute()
-        if res and res.data:
-            user["plan"] = res.data.get("plan", "free")
-            last_spin_date = res.data.get("last_spin_date")
-            if res.data.get("agent_skills"):
-                has_skills = True
-    except Exception:
-        user["plan"] = "free"
-    
-    # Token Data
-    used, limit = get_token_usage_and_limit(user["id"])
-    user["tokens"] = {
-        "used": used, 
-        "limit": limit, 
-        "remaining": max(0, limit - used)
-    }
-    
-    # Project Data
-    try:
-        # select("*") automatically pulls the new snapshot_b64 column
-        res = (
-            supabase.table("projects")
-            .select("*")
-            .eq("owner_id", user["id"])
-            .order("updated_at", desc=True)
-            .execute()
-        )
-        projects = res.data if res and res.data else []
-    except Exception:
-        projects = []
-
-    return templates.TemplateResponse(
-        "dashboard/dashboard.html", 
-        {
-            "request": request, 
-            "projects": projects, 
-            "user": user,
-            "has_skills": has_skills,
-            "last_spin_date": last_spin_date
-        }
-    )
-
-@app.post("/api/tokens/spin")
-async def spin_wheel(request: Request):
-    user = get_current_user(request)
-    payload = await request.json()
- 
-    try:
-        wager = int(payload.get("wager", 0))
-    except (ValueError, TypeError):
-        raise HTTPException(400, "Invalid wager amount.")
- 
-    if wager < 0 or wager > 500_000:
-        raise HTTPException(400, "Wager must be between 0 and 500,000.")
- 
-    # Fetch state from DB first
-    user_data = supabase.table("users").select(
-        "last_spin_date, tokens_used, tokens_limit"
-    ).eq("id", user["id"]).single().execute().data or {}
- 
-    used  = int(user_data.get("tokens_used")  or 0)
-    limit = int(user_data.get("tokens_limit") or DEFAULT_TOKEN_LIMIT)
-    remaining = max(0, limit - used)
- 
-    if wager > remaining:
-        raise HTTPException(400, "You do not have enough credits for this wager.")
- 
-    # ✅ UTC date — consistent regardless of server timezone
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if user_data.get("last_spin_date") == today_str:
-        raise HTTPException(400, "You have already used your daily spin.")
- 
-    rand = random.random()
-    if rand < 0.50:
-        multiplier = 0.0
-    elif rand < 0.80:
-        multiplier = 1.5
-    else:
-        multiplier = 2.0
- 
-    if multiplier == 0.0:
-        net_change = -wager
-    else:
-        net_change = int(wager * multiplier) - wager
- 
-    # ✅ Floor at 0 — tokens_used can NEVER go negative (infinite token exploit fixed)
-    new_used = max(0, used - net_change)
- 
-    supabase.table("users").update({
-        "last_spin_date": today_str,
-        "tokens_used":    new_used,
-    }).eq("id", user["id"]).execute()
- 
-    return {"status": "success", "multiplier": multiplier, "net_change": net_change}
- 
-# ==========================================================================
-# SETTINGS & AGENT SKILLS ROUTES
-# ==========================================================================
-import secrets
-from fastapi import Request, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
-
-@app.get("/settings", response_class=HTMLResponse)
-async def settings_page(request: Request):
-    user = get_current_user(request)
-    
-    try:
-        res = supabase.table("users").select(
-            "plan, email, gorilla_api_key, github_access_token, figma_access_token, supabase_access_token"
-        ).eq("id", user["id"]).single().execute()
-        
-        if res and res.data:
-            db_user = res.data
-            
-            raw_plan = db_user.get("plan") or "free"
-            user["plan"] = str(raw_plan).lower().strip()
-            
-            user["email"] = db_user.get("email") or user.get("email", "")
-            user["gorilla_api_key"] = db_user.get("gorilla_api_key") or ""
-            user["has_github"] = bool(db_user.get("github_access_token"))
-            user["has_figma"] = bool(db_user.get("figma_access_token"))
-            user["has_supabase"] = bool(db_user.get("supabase_access_token"))
-        else:
-            user["plan"] = "free"
-            user["gorilla_api_key"] = ""
-            user["has_github"] = False
-            user["has_figma"] = False
-            user["has_supabase"] = False
-            
-    except Exception as e:
-        print(f"Error loading settings: {e}")
-        user["plan"] = "free"
-        user["gorilla_api_key"] = ""
-        
-    success_msg = request.query_params.get("success")
-    error_msg = request.query_params.get("error")
-        
-    return templates.TemplateResponse("dashboard/settings.html", {
-        "request": request, 
-        "user": user,
-        "success": success_msg,
-        "error": error_msg
-    })
-
-
-# 3. REGENERATE API KEY ROUTE
-@app.post("/api/user/regenerate-key")
-async def regenerate_api_key(request: Request):
-    user = get_current_user(request)
-    new_key = f"gb_live_{secrets.token_hex(24)}"
-    try:
-        supabase.table("users").update({"gorilla_api_key": new_key}).eq("id", user["id"]).execute()
-        return RedirectResponse("/settings?success=API+Key+regenerated+successfully", status_code=303)
-    except Exception as e:
-        return RedirectResponse("/settings?error=Failed+to+regenerate+key", status_code=303)
-
-
-@app.get("/settings/skills", response_class=HTMLResponse)
-async def agent_skills_page(request: Request):
-    user = get_current_user(request)
-    api_key = ""
-    try:
-        res = supabase.table("users").select("plan, gorilla_api_key").eq("id", user["id"]).single().execute()
-        if res and res.data:
-            user["plan"] = res.data.get("plan", "free")
-            api_key = res.data.get("gorilla_api_key", "")
-        else:
-            user["plan"] = "free"
-    except Exception:
-        user["plan"] = "free"
-        
-    return templates.TemplateResponse(
-        "dashboard/agentskills.html", 
-        {
-            "request": request, 
-            "user": user,
-            "gorilla_api_key": api_key 
-        }
-    )
-
-@app.post("/api/user/skills")
-async def save_agent_skills(request: Request):
-    user = get_current_user(request)
-    try:
-        payload = await request.json()
-        supabase.table("users").update({"agent_skills": payload}).eq("id", user["id"]).execute()
-        return JSONResponse({"status": "success", "message": "Skills saved successfully"})
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return JSONResponse({"detail": f"Failed to save skills: {str(e)}"}, status_code=500)
-
 
 # ==========================================================================
 # PROJECT ROUTES (RLS-COMPLIANT)
@@ -1594,6 +772,60 @@ async def generate_project_snapshot(project_id: str, prompt: str, user_api_key: 
     except Exception as e:
         print(f"Snapshot task crashed: {e}")
 
+# ==========================================================================
+# DASHBOARD & WORKSPACE
+# ==========================================================================
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    user = get_current_user(request)
+
+    # Fetch latest Plan, Agent Skills, and Last Spin Date from DB
+    has_skills = False
+    last_spin_date = None
+    try:
+        res = supabase.table("users").select("plan, agent_skills, last_spin_date").eq("id", user["id"]).single().execute()
+        if res and res.data:
+            user["plan"] = res.data.get("plan", "free")
+            last_spin_date = res.data.get("last_spin_date")
+            if res.data.get("agent_skills"):
+                has_skills = True
+    except Exception:
+        user["plan"] = "free"
+
+    # Token Data
+    used, limit = get_token_usage_and_limit(user["id"])
+    user["tokens"] = {
+        "used": used,
+        "limit": limit,
+        "remaining": max(0, limit - used)
+    }
+
+    # Project Data
+    try:
+        # select("*") automatically pulls the new snapshot_b64 column
+        res = (
+            supabase.table("projects")
+            .select("*")
+            .eq("owner_id", user["id"])
+            .order("updated_at", desc=True)
+            .execute()
+        )
+        projects = res.data if res and res.data else []
+    except Exception:
+        projects = []
+
+    return templates.TemplateResponse(
+        "dashboard/dashboard.html",
+        {
+            "request": request,
+            "projects": projects,
+            "user": user,
+            "has_skills": has_skills,
+            "last_spin_date": last_spin_date
+        }
+    )
+
 # 1. CREATE PAGE (Stash prompt in session & detect Figma)
 @app.get("/projects/createit", response_class=HTMLResponse)
 async def project_create_page(request: Request, prompt: Optional[str] = None):
@@ -1619,6 +851,7 @@ async def project_create_page(request: Request, prompt: Optional[str] = None):
 
 # 2. CREATE ACTION (Backend Insert)
 from backend.figma_import import fetch_and_compress_figma, compile_figma_to_react
+from backend.github_import import fetch_github_repo_files
 import re
 import urllib.parse
 import asyncio
@@ -1632,11 +865,22 @@ async def create_project(
     name: Optional[str] = Form(None),
     description: str = Form(""),
     xmode: Optional[str] = Form(None),
+    think_mode: Optional[str] = Form(None),
     image_base64: Optional[str] = Form(None),
     figma_url: Optional[str] = Form(None),
     use_supabase: Optional[str] = Form(None),
+    github_url: Optional[str] = Form(None),
 ):
     user = get_current_user(request)
+
+    # Explicit think-mode selector ("fast" | "normal" | "deep") from the
+    # dashboard's mode dropdown — replaces the old approach of prepending a
+    # magic instruction string into the visible prompt text. (`xmode` is an
+    # unrelated legacy field from the confirmation form's submit button —
+    # not used for this.)
+    think_mode = (think_mode or "normal").lower()
+    if think_mode not in ("fast", "normal", "deep"):
+        think_mode = "normal"
  
     def check_project_limit():
         res = supabase.table("projects").select("id", count="exact").eq("owner_id", user["id"]).execute()
@@ -1661,26 +905,41 @@ async def create_project(
     if prompt and not name:
         if figma_url:
             request.session["stashed_figma_url"] = figma_url
+        if github_url:
+            request.session["stashed_github_url"] = github_url
         is_figma_link = bool(figma_url or (prompt and "figma.com" in prompt))
         return templates.TemplateResponse("projects/project-create.html", {
             "request": request, "user": user,
             "initial_prompt": prompt, "stashed_image": image_base64,
-            "is_figma_link": is_figma_link,
+            "is_figma_link": is_figma_link, "think_mode": think_mode,
         })
- 
+
+    # A GitHub-only import may have no typed prompt at all — allow that path
+    # to reach the confirmation screen too (mirrors the figma_url branch
+    # above, just without requiring `prompt`).
+    if github_url and not name and not prompt:
+        request.session["stashed_github_url"] = github_url
+        return templates.TemplateResponse("projects/project-create.html", {
+            "request": request, "user": user,
+            "initial_prompt": None, "stashed_image": image_base64,
+            "is_figma_link": False, "think_mode": think_mode,
+        })
+
     final_prompt = prompt or request.session.pop("stashed_prompt", None)
     final_figma_url = figma_url or request.session.pop("stashed_figma_url", None)
+    final_github_url = github_url or request.session.pop("stashed_github_url", None)
     project_name = name or "Untitled Project"
     final_image = image_base64
     final_figma_json = None
- 
+    final_github_files = None
+
     # --- 3. FIGMA INTERCEPTOR ---
     potential_url = final_figma_url or ""
     if not potential_url and final_prompt and "figma.com/" in final_prompt:
         match = re.search(r"(https://[^\\s^?]*figma\\.com/[^\\s]*)", final_prompt)
         if match:
             potential_url = match.group(0)
- 
+
     if potential_url:
         try:
             def get_figma_token():
@@ -1700,7 +959,19 @@ async def create_project(
                 )
         except Exception as e:
             return RedirectResponse(f"/dashboard?error={urllib.parse.quote(str(e))}", status_code=303)
- 
+
+    # --- 3B. GITHUB IMPORT INTERCEPTOR ---
+    if final_github_url:
+        try:
+            final_github_files = await fetch_github_repo_files(final_github_url)
+            final_prompt = (
+                "I've imported an existing codebase into this project. Take a look at the "
+                "file structure and give me a brief summary of what this app does and its "
+                "tech stack, then wait for my next instruction — don't make any changes yet."
+            )
+        except Exception as e:
+            return RedirectResponse(f"/dashboard?error={urllib.parse.quote(str(e))}", status_code=303)
+
     # BUG 5 FIX: fetch api_key + supabase token OUTSIDE the closure so they\'re captured
     user_keys_for_env = db_select_one(
         "users", {"id": user["id"]},
@@ -1883,14 +1154,24 @@ async def create_project(
                 }).execute()
             except Exception:
                 pass
- 
+
+        if final_github_files:
+            try:
+                github_rows = [
+                    {"project_id": pid, "path": gh_path, "content": gh_content}
+                    for gh_path, gh_content in final_github_files.items()
+                ]
+                db_upsert_batch("files", github_rows, on_conflict="project_id,path")
+            except Exception as e:
+                print(f"GitHub import file insert failed: {e}")
+
         return pid
  
     # --- 5. EXECUTION ---
     try:
         pid = await asyncio.to_thread(_heavy_lift_create)
  
-        if final_prompt and not final_figma_json and not final_image:
+        if final_prompt and not final_figma_json and not final_image and not final_github_files:
             if gorilla_api_key_for_env.startswith("gb_live_"):
                 background_tasks.add_task(
                     generate_project_snapshot, pid, final_prompt, gorilla_api_key_for_env,
@@ -1900,6 +1181,7 @@ async def create_project(
         # After
         if final_prompt:
             request.session["editor_prompt"] = final_prompt
+            request.session["editor_think_mode"] = think_mode
         return RedirectResponse(f"/projects/{pid}/editor", status_code=303)
  
     except Exception as e:
@@ -1915,6 +1197,7 @@ async def project_editor(request: Request, project_id: str, file: str = "index.h
     
     if not prompt:
         prompt = request.session.pop("editor_prompt", None)
+    initial_think_mode = request.session.pop("editor_think_mode", "normal")
 
     # 1. Fetch User Data (API Keys & Integrations)
     user_data = db_select_one("users", {"id": user["id"]}, "gorilla_api_key, github_access_token, supabase_access_token")
@@ -1952,6 +1235,7 @@ async def project_editor(request: Request, project_id: str, file: str = "index.h
             "file": file, 
             "user": user,
             "initial_prompt": prompt,
+            "initial_think_mode": initial_think_mode,
             "has_github": has_github,
             "has_supabase": has_supabase,
             "project_has_db": project_has_db,
@@ -2309,6 +1593,10 @@ import httpx
 # Global tracking for active AI fixes
 active_ai_fixes = set()
 _AGENT_TASKS = set()
+# Per-project active-run guard — prevents two concurrent agent/start calls
+# (double-click, duplicate tab, retry-storm) from driving the same sandbox
+# session at once, which corrupts file-write ordering and turn state.
+_AGENT_TASKS_BY_PROJECT: Dict[str, asyncio.Task] = {}
 
 
 async def run_agent_loop(
@@ -2319,6 +1607,7 @@ async def run_agent_loop(
     history: list = None,
     skip_planner: bool = False,
     is_system_task: bool = False,
+    think_mode: str = "normal",
 ):
     try:
         await asyncio.sleep(0.2)
@@ -2399,7 +1688,10 @@ async def run_agent_loop(
                         has_supabase = True
 
                         supa_anon_key = ""
-                        for _ in range(45):
+                        for i in range(45):
+                            if i and i % 5 == 0:
+                                emit_log(project_id, "system",
+                                    f"Still waiting for database to come online ({i * 4}s)...")
                             s = await client.get(
                                 f"https://api.supabase.com/v1/projects/{project_ref}",
                                 headers=headers,
@@ -2407,7 +1699,12 @@ async def run_agent_loop(
                             if s.status_code == 200 and s.json().get("status") in ["ACTIVE_HEALTHY", "ACTIVE"]:
                                 break
                             await asyncio.sleep(4)
-                        for _ in range(10):
+                        else:
+                            emit_log(project_id, "system",
+                                "Database is taking longer than expected to come online; continuing anyway.")
+                        for i in range(10):
+                            if i and i % 3 == 0:
+                                emit_log(project_id, "system", "Waiting for database API keys...")
                             k = await client.get(
                                 f"https://api.supabase.com/v1/projects/{project_ref}/api-keys",
                                 headers=headers,
@@ -2423,6 +1720,9 @@ async def run_agent_loop(
                                         supa_anon_key = anon["api_key"]
                                         break
                             await asyncio.sleep(3)
+                        if not supa_anon_key:
+                            emit_log(project_id, "system",
+                                "Could not retrieve database API key yet; it will sync on your next message.")
 
                         if supa_anon_key:
                             supa_url = f"https://{project_ref}.supabase.co"
@@ -2497,6 +1797,7 @@ async def run_agent_loop(
             image_b64=image_b64 if not skip_planner else None,
             on_assistant_message=on_assistant_message,
             agent_skills=agent_skills,  # ← add this line
+            think_mode=think_mode,
         )
 
         # Charge tokens immediately after the turn completes
@@ -2931,139 +2232,6 @@ async def push_for_deployment(request: Request, project_id: str):
         traceback.print_exc()
         return JSONResponse({"detail": str(e)}, status_code=500)
 
-# ==========================================================================
-# APP AUTH GATEWAY (For Generated Apps)
-# ==========================================================================
-
-@app.get("/api/v1/app-auth/login", response_class=HTMLResponse)
-async def app_auth_login_page(request: Request, auth_id: str, return_url: str = ""):
-    """Renders the Hosted Login Page for the generated app."""
-    proj = db_select_one("projects", {"gorilla_auth_id": auth_id}, "name")
-    if not proj:
-        return HTMLResponse("<h1>Invalid App Auth ID</h1>", status_code=404)
-    
-    request.session["app_auth_pending"] = {"auth_id": auth_id, "return_url": return_url}
-    
-    return templates.TemplateResponse("auth/appauth.html", {
-        "request": request,
-        "project_name": proj.get("name", "this app"),
-        "auth_id": auth_id,
-        "step": "login"
-    })
-
-@app.get("/api/v1/app-auth/{auth_id}/google")
-async def app_auth_google_init(request: Request, auth_id: str):
-    scope = "openid email profile"
-    site_url = os.getenv('SITE_URL')
-    redirect_uri = urllib.parse.quote(f"{site_url}/api/v1/app-auth/google/callback")
-    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?response_type=code&client_id={GOOGLE_CLIENT_ID}&redirect_uri={redirect_uri}&scope={scope}&state={auth_id}"
-    return RedirectResponse(auth_url)
-
-@app.get("/api/v1/app-auth/{auth_id}/github")
-async def app_auth_github_init(request: Request, auth_id: str):
-    scope = "user:email"
-    site_url = os.getenv('SITE_URL')
-    redirect_uri = urllib.parse.quote(f"{site_url}/api/v1/app-auth/github/callback")
-    auth_url = f"https://github.com/login/oauth/authorize?client_id={GITHUB_APPAUTH_CLIENT_ID}&redirect_uri={redirect_uri}&scope={scope}&state={auth_id}"
-    return RedirectResponse(auth_url)
-
-@app.get("/api/v1/app-auth/google/callback")
-async def app_auth_google_callback(request: Request, code: str, state: str):
-    site_url = os.getenv('SITE_URL')
-    async with httpx.AsyncClient() as client:
-        res = await client.post("https://oauth2.googleapis.com/token", data={
-            "code": code,
-            "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "redirect_uri": f"{site_url}/api/v1/app-auth/google/callback",
-            "grant_type": "authorization_code",
-        })
-        tokens = res.json()
-        access_token = tokens.get("access_token")
-        
-        user_res = await client.get(
-            "https://www.googleapis.com/oauth2/v1/userinfo", 
-            headers={"Authorization": f"Bearer {access_token}"}
-        )
-        google_user = user_res.json()
-        
-    user_payload = {
-        "id": google_user.get("id"),
-        "email": google_user.get("email"),
-        "name": google_user.get("name"),
-        "avatar": google_user.get("picture"),
-        "provider": "google"
-    }
-    
-# Track app login via analytics
-    try:
-        proj = db_select_one("projects", {"gorilla_auth_id": state}, "id")
-        if proj:
-            track_event(
-                proj["id"], "login",
-                user_email=user_payload.get("email"),
-                user_provider="google",
-                metadata={"name": user_payload.get("name")},
-            )
-    except Exception:
-        pass
-
-    return templates.TemplateResponse("auth/appauth.html", {
-        "request": request,
-        "step": "success",
-        "user_data": json.dumps(user_payload)
-    })
-
-@app.get("/api/v1/app-auth/github/callback")
-async def app_auth_github_callback(request: Request, code: str, state: str):
-    site_url = os.getenv('SITE_URL')
-    async with httpx.AsyncClient() as client:
-        res = await client.post(
-            "https://github.com/login/oauth/access_token", 
-            data={
-                "client_id": GITHUB_APPAUTH_CLIENT_ID,
-                "client_secret": GITHUB_APPAUTH_CLIENT_SECRET,
-                "code": code,
-                "redirect_uri": f"{site_url}/api/v1/app-auth/github/callback"
-            },
-            headers={"Accept": "application/json"}
-        )
-        tokens = res.json()
-        access_token = tokens.get("access_token")
-        
-        user_res = await client.get(
-            "https://api.github.com/user", 
-            headers={"Authorization": f"Bearer {access_token}"}
-        )
-        github_user = user_res.json()
-        
-    user_payload = {
-        "id": str(github_user.get("id")),
-        "email": github_user.get("email"),
-        "name": github_user.get("name") or github_user.get("login"),
-        "avatar": github_user.get("avatar_url"),
-        "provider": "github"
-    }
-    
-# Track app login via analytics
-    try:
-        proj = db_select_one("projects", {"gorilla_auth_id": state}, "id")
-        if proj:
-            track_event(
-                proj["id"], "login",
-                user_email=user_payload.get("email"),
-                user_provider="github",
-                metadata={"name": user_payload.get("name")},
-            )
-    except Exception:
-        pass
-
-    return templates.TemplateResponse("auth/appauth.html", {
-        "request": request,
-        "step": "success",
-        "user_data": json.dumps(user_payload)
-    })
-
 # 4. Push to GitHub
 
 @app.post("/projects/{project_id}/github/publish")
@@ -3197,434 +2365,6 @@ async def publish_to_github(request: Request, project_id: str):
         import traceback
         traceback.print_exc()
         return JSONResponse({"detail": str(e)}, status_code=500)
-
-# ==========================================================================
-# Design Routes
-# ==========================================================================
-
-from backend.design.design import (
-    generate_design, edit_design,
-    design_to_html, get_hosted_html, generate_slug, to_figma_clipboard,
-)
-import json # Ensure json is imported for the compat shims
-
-@app.get("/design", response_class=HTMLResponse)
-async def design_dashboard(request: Request):
-    user = get_current_user(request)
-    used, limit = get_token_usage_and_limit(user["id"])
-    user["tokens"] = {"used": used, "limit": limit, "remaining": max(0, limit - used)}
-
-    try:
-        # OPTIMIZED: Only fetching lightweight list data, skipping massive JSON blobs
-        res = supabase.table("designs").select("id, name, updated_at, created_at, hosted_slug").eq("owner_id", user["id"]).order("updated_at", desc=True).execute()
-        designs = res.data if res and res.data else []
-    except Exception:
-        designs = []
-
-    return templates.TemplateResponse("design/dashboard.html", {
-        "request": request,
-        "user": user,
-        "designs": designs,
-    })
-
-
-# ── CREATE ───────────────────────────────────────────────────────────────
-
-@app.post("/api/design/create")
-async def create_design(request: Request):
-    user = get_current_user(request)
-    payload = await request.json()
-    name = payload.get("name", "Untitled Design")
-    try:
-        res = supabase.table("designs").insert({
-            "owner_id": user["id"],
-            "name": name,
-            "figma_json": None,
-            "tokens": None,
-        }).execute()
-        return JSONResponse({"id": res.data[0]["id"]})
-    except Exception as e:
-        raise HTTPException(500, detail=str(e))
-
-
-# ── EDITOR ───────────────────────────────────────────────────────────────
-
-@app.get("/design/editor/{design_id}", response_class=HTMLResponse)
-async def design_editor(request: Request, design_id: str):
-    user = get_current_user(request)
-    try:
-        # OPTIMIZED: Explicit column selection, avoiding hosted_html if not strictly needed here
-        res = supabase.table("designs").select("id, name, figma_json, tokens, chat_history, updated_at").eq("id", design_id).eq("owner_id", user["id"]).single().execute()
-        design = res.data
-    except Exception:
-        raise HTTPException(404, "Design not found")
-
-    user_data = db_select_one("users", {"id": user["id"]}, "gorilla_api_key") or {}
-    return templates.TemplateResponse("design/editor.html", {
-        "request": request,
-        "user": user,
-        "design": design,
-        "gorilla_api_key": user_data.get("gorilla_api_key", ""),
-    })
-
-
-# ── VIEWER ───────────────────────────────────────────────────────────────
-
-@app.get("/design/viewer/{design_id}", response_class=HTMLResponse)
-async def design_viewer(request: Request, design_id: str):
-    user = get_current_user_safe(request)
-    try:
-        # OPTIMIZED: Only grab the fields needed to view
-        res = supabase.table("designs").select("id, name, figma_json, hosted_html").eq("id", design_id).single().execute()
-        design = res.data
-    except Exception:
-        raise HTTPException(404, "Design not found")
-    return templates.TemplateResponse("design/viewer.html", {
-        "request": request,
-        "user": user,
-        "design": design,
-    })
-
-
-# ── HOSTED PAGE (public, no auth) ────────────────────────────────────────
-
-@app.get("/design/hosted/{slug}", response_class=HTMLResponse)
-async def design_hosted(slug: str):
-    try:
-        # Already optimized: Only selects hosted_html
-        res = supabase.table("designs").select("hosted_html").eq("hosted_slug", slug).single().execute()
-        design = res.data
-    except Exception:
-        raise HTTPException(404, "Page not found")
-    if not design or not design.get("hosted_html"):
-        raise HTTPException(404, "Page not published yet")
-    return HTMLResponse(content=design["hosted_html"])
-
-
-# ── SAVE ─────────────────────────────────────────────────────────────────
-
-@app.post("/api/design/{design_id}/save")
-async def save_design(request: Request, design_id: str):
-    user = get_current_user(request)
-    payload = await request.json()
-    try:
-        supabase.table("designs").update({
-            "figma_json": payload.get("figma_json"),
-            "tokens": payload.get("tokens"),
-            "updated_at": "now()",
-        }).eq("id", design_id).eq("owner_id", user["id"]).execute()
-        return JSONResponse({"ok": True})
-    except Exception as e:
-        raise HTTPException(500, detail=str(e))
-
-
-# ── GENERATE — the main design creation endpoint ──────────────────────────
-
-@app.post("/api/design/{design_id}/generate")
-async def generate_design_endpoint(request: Request, design_id: str, background_tasks: BackgroundTasks):
-    """
-    Generate a complete design from a brief.
-    Returns immediately with status, polls /api/design/{id}/status for result.
-    Avoids ngrok 30s timeout.
-    """
-    user = get_current_user(request)
-    try:
-        await asyncio.to_thread(enforce_token_limit_or_raise, user["id"])
-    except HTTPException as e:
-        if e.status_code == 402:
-            raise HTTPException(402, "Token limit reached")
-        raise
-
-    payload = await request.json()
-    brief = payload.get("brief", "").strip()
-    if not brief:
-        raise HTTPException(400, "Brief required")
-
-    # Mark as generating
-    supabase.table("designs").update({
-        "chat_history": [{"role": "user", "content": brief}],
-        "name": brief[:40].split(".")[0].strip().title() or "Generating...",
-        "updated_at": "now()",
-    }).eq("id", design_id).eq("owner_id", user["id"]).execute()
-
-    async def _generate_bg(design_id: str, brief: str, user_id: str):
-        import asyncio
-        def _save(data: dict):
-            supabase.table("designs").update(data).eq("id", design_id).eq("owner_id", user_id).execute()
-        def _charge():
-            add_monthly_tokens(user_id, 3000)
-        try:
-            result = await generate_design(brief)
-            figma_json = result["figma_json"]
-            tokens = result["tokens"]
-            html = result["html"]
-            name = result["name"] or brief[:40].strip().title() or "Untitled"
-            figma_json["_raw_html"] = html
-            # Run sync Supabase call in thread to avoid blocking event loop
-            await asyncio.to_thread(_save, {
-                "figma_json": figma_json,
-                "tokens": tokens,
-                "name": name,
-                "hosted_html": html,
-                "chat_history": [
-                    {"role": "user", "content": brief},
-                    {"role": "assistant", "content": f'Generated "{name}"'},
-                ],
-                "updated_at": "now()",
-            })
-            await asyncio.to_thread(_charge)
-        except Exception as e:
-            import traceback; traceback.print_exc()
-            try:
-                await asyncio.to_thread(_save, {
-                    "chat_history": [
-                        {"role": "user", "content": brief},
-                        {"role": "assistant", "content": f"Error: {str(e)[:200]}"},
-                    ],
-                    "updated_at": "now()",
-                })
-            except Exception:
-                pass
-
-    import asyncio
-    asyncio.create_task(_generate_bg(design_id, brief, user["id"]))
-    return JSONResponse({"status": "generating", "design_id": design_id})
-
-
-@app.get("/api/design/{design_id}/status")
-async def design_status(request: Request, design_id: str):
-    """Poll this after /generate to get the result."""
-    user = get_current_user(request)
-    try:
-        res = supabase.table("designs").select("figma_json, tokens, name, chat_history").eq("id", design_id).eq("owner_id", user["id"]).single().execute()
-        d = res.data
-    except Exception:
-        raise HTTPException(404, "Design not found")
-
-    if d.get("figma_json"):
-        return JSONResponse({"status": "done", "figma_json": d["figma_json"], "tokens": d.get("tokens", {}), "name": d.get("name", "")})
-
-    # Check if error in chat history
-    history = d.get("chat_history") or []
-    last = history[-1] if history else {}
-    if last.get("content", "").startswith("Error:"):
-        return JSONResponse({"status": "error", "detail": last["content"]})
-
-    return JSONResponse({"status": "generating"})
-
-
-# Keep old endpoint name working too
-@app.post("/api/design/{design_id}/setup-tokens")
-async def setup_tokens_compat(request: Request, design_id: str):
-    """Compat shim — routes old setup-tokens calls to generate."""
-    payload = await request.json()
-    brand = payload.get("brand", payload.get("brief", ""))
-    request._body = json.dumps({"brief": brand}).encode()
-    return await generate_design_endpoint(request, design_id)
-
-
-# ── EDIT — surgical search/replace on existing design ────────────────────
-
-@app.post("/api/design/{design_id}/edit")
-async def edit_design_endpoint(request: Request, design_id: str):
-    """
-    Edit an existing design via surgical ops.
-    No full rewrites — just targeted changes.
-    """
-    user = get_current_user(request)
-    try:
-        await asyncio.to_thread(enforce_token_limit_or_raise, user["id"])
-    except HTTPException as e:
-        if e.status_code == 402:
-            raise HTTPException(402, "Token limit reached")
-        raise
-
-    payload = await request.json()
-    instruction = payload.get("instruction", "").strip()
-    if not instruction:
-        raise HTTPException(400, "Instruction required")
-
-    try:
-        # OPTIMIZED: Fetches everything needed in ONE database call instead of two
-        res = supabase.table("designs").select("figma_json, tokens, chat_history").eq("id", design_id).eq("owner_id", user["id"]).single().execute()
-        design = res.data
-    except Exception:
-        raise HTTPException(404, "Design not found")
-
-    tree = design.get("figma_json")
-    if not tree:
-        raise HTTPException(400, "No design to edit yet. Generate one first.")
-
-    try:
-        existing_html = tree.get("_raw_html", "")
-        result = await edit_design(existing_html or "", instruction)
-
-        updated_tree = result["figma_json"]
-        tokens = result["tokens"]
-        html = result["html"]
-        narration = result["narration"]
-
-        # Store raw HTML back
-        updated_tree["_raw_html"] = html
-
-        # OPTIMIZED: Use the history we already fetched above
-        history = design.get("chat_history") or []
-        history.append({"role": "user", "content": instruction})
-        history.append({"role": "assistant", "content": narration})
-        if len(history) > 100:
-            history = history[-100:]
-
-        supabase.table("designs").update({
-            "figma_json": updated_tree,
-            "tokens": tokens,
-            "hosted_html": html,
-            "chat_history": history,
-            "updated_at": "now()",
-        }).eq("id", design_id).eq("owner_id", user["id"]).execute()
-
-        add_monthly_tokens(user["id"], 500)
-
-        return JSONResponse({
-            "figma_json": updated_tree,
-            "tokens": tokens,
-            "narration": narration,
-            "html": html,
-        })
-
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        raise HTTPException(500, detail=str(e))
-
-
-# Keep old agent endpoint working too
-@app.post("/api/design/{design_id}/agent")
-async def agent_compat(request: Request, design_id: str):
-    """Compat shim — routes old agent calls to edit."""
-    payload = await request.json()
-    instruction = payload.get("instruction", payload.get("message", ""))
-    request._body = json.dumps({"instruction": instruction}).encode()
-    return await edit_design_endpoint(request, design_id)
-
-
-# ── IMAGE GENERATION ─────────────────────────────────────────────────────
-
-@app.post("/api/design/{design_id}/image")
-async def generate_image_endpoint(request: Request, design_id: str):
-    """Generate an image and embed it as a fill on a specific node."""
-    user = get_current_user(request)
-    payload = await request.json()
-    node_id = payload.get("node_id", "")
-    prompt = payload.get("prompt", "")
-    if not node_id or not prompt:
-        raise HTTPException(400, "node_id and prompt required")
-
-    try:
-        res = supabase.table("designs").select("figma_json").eq("id", design_id).eq("owner_id", user["id"]).single().execute()
-        tree = res.data.get("figma_json") or {}
-    except Exception:
-        raise HTTPException(404, "Design not found")
-
-    user_data = db_select_one("users", {"id": user["id"]}, "gorilla_api_key") or {}
-    api_key = user_data.get("gorilla_api_key", "")
-
-    updated_tree, success = await generate_image_fill(node_id, prompt, tree, api_key)
-
-    if success:
-        supabase.table("designs").update({
-            "figma_json": updated_tree,
-            "updated_at": "now()",
-        }).eq("id", design_id).eq("owner_id", user["id"]).execute()
-        add_monthly_tokens(user["id"], 8000)
-
-    return JSONResponse({"ok": success, "figma_json": updated_tree if success else tree})
-
-
-# ── EXPORT: FIGMA JSON download ───────────────────────────────────────────
-
-@app.post("/api/design/{design_id}/export/figma")
-async def export_figma(request: Request, design_id: str):
-    user = get_current_user(request)
-    try:
-        res = supabase.table("designs").select("figma_json, name").eq("id", design_id).eq("owner_id", user["id"]).single().execute()
-        design = res.data
-    except Exception:
-        raise HTTPException(404, "Design not found")
-    return JSONResponse({"payload": design.get("figma_json"), "name": design.get("name")})
-
-
-# ── EXPORT: HTML download ─────────────────────────────────────────────────
-
-@app.post("/api/design/{design_id}/export/html")
-async def export_html(request: Request, design_id: str):
-    user = get_current_user(request)
-    try:
-        res = supabase.table("designs").select("figma_json").eq("id", design_id).eq("owner_id", user["id"]).single().execute()
-        tree = res.data.get("figma_json") or {}
-    except Exception:
-        raise HTTPException(404, "Design not found")
-    html = design_to_html(tree)
-    return Response(content=html, media_type="text/html")
-
-
-# ── EXPORT: HOST as public page ───────────────────────────────────────────
-
-@app.post("/api/design/{design_id}/export/host")
-async def export_host(request: Request, design_id: str):
-    user = get_current_user(request)
-    try:
-        # OPTIMIZED: Stop pulling chat history and tokens here
-        res = supabase.table("designs").select("figma_json, name, hosted_slug, hosted_html").eq("id", design_id).eq("owner_id", user["id"]).single().execute()
-        design = res.data
-    except Exception:
-        raise HTTPException(404, "Design not found")
-
-    tree = design.get("figma_json") or {}
-    name = design.get("name", "design")
-    slug = design.get("hosted_slug") or generate_slug(name)
-    site_url = os.getenv("SITE_URL", "")
-
-    # Use stored HTML if available (new HTML-first format)
-    raw_html = tree.get("_raw_html") or design.get("hosted_html") or ""
-    if raw_html:
-        html = get_hosted_html(raw_html, design_id=design_id, site_url=site_url)
-    else:
-        html = get_hosted_html(design_to_html(tree), design_id=design_id, site_url=site_url)
-
-    supabase.table("designs").update({
-        "hosted_slug": slug,
-        "hosted_html": html,
-        "updated_at": "now()",
-    }).eq("id", design_id).execute()
-
-    return JSONResponse({"url": f"{site_url}/design/hosted/{slug}", "slug": slug})
-
-
-# ── EXPORT: Figma clipboard (paste directly into Figma) ───────────────────
-
-@app.post("/api/design/{design_id}/export/figma-clipboard")
-async def export_figma_clipboard(request: Request, design_id: str):
-    user = get_current_user(request)
-    try:
-        res = supabase.table("designs").select("figma_json, name").eq("id", design_id).eq("owner_id", user["id"]).single().execute()
-        design = res.data
-    except Exception:
-        raise HTTPException(404, "Design not found")
-    tree = design.get("figma_json") or {}
-    # Returns the HTML string that Figma reads from clipboard
-    clipboard_html = to_figma_clipboard(tree)
-    return Response(content=clipboard_html, media_type="text/plain")
-
-# ── DELETE ────────────────────────────────────────────────────────────────
-
-@app.post("/api/design/{design_id}/delete")
-async def delete_design(request: Request, design_id: str):
-    user = get_current_user(request)
-    try:
-        supabase.table("designs").delete().eq("id", design_id).eq("owner_id", user["id"]).execute()
-        return JSONResponse({"ok": True})
-    except Exception as e:
-        raise HTTPException(500, detail=str(e))
-
 
 
 # ==========================================================================
@@ -4156,7 +2896,11 @@ async def _fetch_file_tree(project_id: str) -> Dict[str, str]:
 async def agent_start(request: Request, project_id: str):
     user = get_current_user(request)
     _require_project_owner(user, project_id)
- 
+
+    existing = _AGENT_TASKS_BY_PROJECT.get(project_id)
+    if existing and not existing.done():
+        return {"started": False, "error": "Agent is already running for this project."}
+
     try:
         await asyncio.to_thread(enforce_token_limit_or_raise, user["id"])
     except HTTPException as e:
@@ -4164,12 +2908,18 @@ async def agent_start(request: Request, project_id: str):
             emit_log(project_id, "assistant", _render_token_limit_message())
             return {"started": False}
         raise
- 
+
     form_data = await request.form()
     prompt = str(form_data.get("prompt", ""))
     image_base64 = form_data.get("image_base64")
     skip_planner = str(form_data.get("skip_planner", "false")).lower() == "true"
- 
+
+    # Explicit mode selector (replaces the old "prepend a magic instruction
+    # string to the visible prompt" hack) — see lineage_agent.MODE_INSTRUCTIONS.
+    think_mode = str(form_data.get("think_mode", "normal")).lower()
+    if think_mode not in ("fast", "normal", "deep"):
+        think_mode = "normal"
+
     # is_db_request still matters — it routes to mid-chat Supabase
     # provisioning when the project doesn\'t have supabase_project_ref yet.
     is_db_request = str(form_data.get("is_db_request", "false")).lower() == "true"
@@ -4201,11 +2951,17 @@ async def agent_start(request: Request, project_id: str):
             agent_type=agent_type,
             skip_planner=skip_planner,
             is_system_task=False,
+            think_mode=think_mode,
         )
     )
     _AGENT_TASKS.add(task)
     task.add_done_callback(_AGENT_TASKS.discard)
- 
+    _AGENT_TASKS_BY_PROJECT[project_id] = task
+    task.add_done_callback(
+        lambda t: _AGENT_TASKS_BY_PROJECT.pop(project_id, None)
+        if _AGENT_TASKS_BY_PROJECT.get(project_id) is t else None
+    )
+
     # Also surface exceptions that the task raises — without this, any
     # error inside run_agent_loop that isn\'t caught by its own try/except
     # would be swallowed silently.
@@ -4412,312 +3168,6 @@ async def save_negotiation(request: Request, data: NegotiationResult):
         raise HTTPException(status_code=500, detail="Database error while saving price.")
 
 
-# ==========================================================================
-# THE GORILLA AI PROXY GATEWAY
-# ==========================================================================
-
-# Add these missing OpenRouter variables!
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_URL = os.getenv("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
-OPENROUTER_SITE_URL = "https://gorillabuilder.dev"
-SITE_NAME = os.getenv("SITE_NAME", "Gorilla Builder")
-
-import math
-from fastapi import APIRouter, Depends, HTTPException, File, UploadFile, Form
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import JSONResponse, Response, StreamingResponse
-
-security = HTTPBearer()
-
-# --- Proxy Environment Variables ---
-FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY")
-REMBG_API_KEY = os.getenv("REMBG_API_KEY", "") # If your RemBG has a key
-REMBG_API_URL = os.getenv("REMBG_API_URL", "http://localhost:5000/api/remove")
-
-def _deduct_proxy_tokens(user_id: str, cost: float, feature: str):
-    """Helper to safely deduct tokens for API Gateway usage."""
-    if cost <= 0: return
-    try:
-        tokens_to_add = math.ceil(cost) # Round up fractional tokens
-        
-        # 1. Fetch current tokens_used from the users table
-        res = supabase.table("users").select("tokens_used").eq("id", user_id).single().execute()
-        current_used = res.data.get("tokens_used", 0) if res.data and res.data.get("tokens_used") else 0
-        
-        # 2. Add the cost and update the database
-        new_total = current_used + tokens_to_add
-        supabase.table("users").update({"tokens_used": new_total}).eq("id", user_id).execute()
-        
-        print(f"💰 Deducted {tokens_to_add} tokens for {feature} (User: {user_id})")
-    except Exception as e:
-        print(f"⚠️ Failed to deduct {cost} tokens for {user_id}: {e}")
-
-async def verify_gorilla_key(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    api_key = credentials.credentials
-    print(f"🔑 key received: {api_key[:20]}...")
-    
-    if not api_key.startswith("gb_live_"):
-        print(f"🔑 REJECTED: bad format")
-        raise HTTPException(status_code=401, detail="Invalid API Key format. Must start with 'gb_live_'")
-    
-    res = supabase.table("users").select("id, plan").eq("gorilla_api_key", api_key).single().execute()
-    print(f"🔑 DB lookup: {res.data}")
-    
-    if not res or not res.data:
-        print(f"🔑 REJECTED: key not found in DB")
-        raise HTTPException(status_code=401, detail="Invalid API Key. Unauthorized.")
-    
-    user = res.data
-    used, limit = get_token_usage_and_limit(user["id"])
-    print(f"🔑 tokens: used={used} limit={limit}")
-    
-    if used >= limit:
-        raise HTTPException(status_code=402, detail="Token limit reached.")
-    
-    print(f"🔑 APPROVED: user={user['id']}")
-    return {"user_id": user["id"], "plan": user.get("plan")}
-
-# --- 1. LLM CHAT (OpenRouter / 0.5 tokens per 1 API token) ---
-@app.post("/api/v1/chat/completions")
-async def proxy_chat_completions(request: Request, auth=Depends(verify_gorilla_key)):
-    user_id = auth["user_id"]
-    payload = await request.json()
-    
-    # Force the model to OpenRouter's massive 120b model as requested
-    payload["model"] = "qwen/qwen3.5-flash-02-23" # Replace with your exact OpenRouter model string
-    
-    # Ask OpenRouter to send usage stats back even if it's a stream
-    if "stream_options" not in payload:
-        payload["stream_options"] = {"include_usage": True}
-        
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": OPENROUTER_SITE_URL,
-        "X-Title": SITE_NAME
-    }
-    
-    # Handle Streaming Responses
-    is_stream = payload.get("stream", False)
-    
-    if is_stream:
-        async def stream_generator():
-            total_tokens = 0
-            async with httpx.AsyncClient() as client:
-                async with client.stream("POST", OPENROUTER_URL, json=payload, headers=headers) as resp:
-                    if resp.status_code != 200:
-                        yield f"data: {json.dumps({'error': 'Upstream provider error'})}\n\n"
-                        return
-                    
-                    async for chunk in resp.aiter_text():
-                        yield chunk
-                        # OpenRouter includes {"usage": {"total_tokens": X}} in the final SSE chunk
-                        if '"usage":' in chunk and '"total_tokens":' in chunk:
-                            try:
-                                # Quick and dirty parse of the usage chunk
-                                parts = chunk.split('"total_tokens":')
-                                if len(parts) > 1:
-                                    token_val = parts[1].split(',')[0].split('}')[0].strip()
-                                    total_tokens = int(token_val)
-                            except: pass
-            
-            # Bill the user after the stream closes (0.5 tokens per 1 API token)
-            if total_tokens > 0:
-                _deduct_proxy_tokens(user_id, total_tokens * 0.3, "chat_stream")
-                
-        return StreamingResponse(stream_generator(), media_type="text/event-stream")
-    
-    # Handle Standard Non-Streaming Responses
-    else:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(OPENROUTER_URL, json=payload, headers=headers)
-            if resp.status_code != 200:
-                raise HTTPException(status_code=resp.status_code, detail=resp.text)
-            
-            data = resp.json()
-            total_tokens = data.get("usage", {}).get("total_tokens", 0)
-            
-            # Bill the user (0.5 tokens per 1 API token)
-            _deduct_proxy_tokens(user_id, total_tokens * 0.3, "chat")
-            
-            return JSONResponse(data)
-
-
-@app.post("/api/v1/images/generations")
-async def proxy_image_generations(request: Request, auth=Depends(verify_gorilla_key)):
-    user_id = auth["user_id"]
-    print(f"🖼️ IMAGE GEN START — user_id={user_id}")
-    
-    payload = await request.json()
-    prompt = payload.get("prompt", "")
-    print(f"🖼️ prompt={prompt[:100]}")
-    print(f"🖼️ OPENROUTER_API_KEY={'SET len='+str(len(OPENROUTER_API_KEY)) if OPENROUTER_API_KEY else 'EMPTY/NONE'}")
-
-    openrouter_payload = {
-        "model": "black-forest-labs/flux.2-klein-4b",
-        "messages": [{"role": "user", "content": prompt}],
-        "modalities": ["image"],
-        "stream": False,
-    }
-    print(f"🖼️ sending payload={openrouter_payload}")
-
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": OPENROUTER_SITE_URL,
-        "X-Title": SITE_NAME,
-    }
-
-    async with httpx.AsyncClient(timeout=90.0) as client:
-        resp = await client.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            json=openrouter_payload,
-            headers=headers,
-        )
-
-    print(f"🖼️ OpenRouter status={resp.status_code}")
-    print(f"🖼️ OpenRouter body={resp.text[:500]}")
-
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Image gen error {resp.status_code}: {resp.text[:200]}")
-
-    result = resp.json()
-    images = []
-    choices = result.get("choices", [])
-    if choices:
-        msg = choices[0].get("message", {})
-        print(f"🖼️ message keys={list(msg.keys())}")
-        for img in msg.get("images", []):
-            url = img.get("image_url", {}).get("url") or img.get("url", "")
-            if url:
-                images.append({"url": url})
-        if not images and msg.get("content", "").startswith("data:image"):
-            images.append({"url": msg["content"]})
-
-    print(f"🖼️ returning {len(images)} images")
-    _deduct_proxy_tokens(user_id, 8000, "image_gen")
-    return JSONResponse({"data": images})
-
-@app.post("/api/v1/audio/transcriptions")
-async def proxy_audio_transcriptions(
-    file: UploadFile = File(...),
-    model: str = Form("accounts/fireworks/models/whisper-v3-turbo"),
-    auth=Depends(verify_gorilla_key)
-):
-    user_id = auth["user_id"]
-    file_bytes = await file.read()
-    
-    # Heuristic Duration Calculation:
-    # A standard mp3/m4a voice memo is roughly 1MB per minute.
-    # We use file size to estimate minutes (minimum 1 minute)
-    file_size_mb = len(file_bytes) / (1024 * 1024)
-    estimated_minutes = max(1, math.ceil(file_size_mb)) 
-    cost = estimated_minutes * 100
-    
-    headers = {"Authorization": f"Bearer {FIREWORKS_API_KEY}"}
-    files_payload = {"file": (file.filename, file_bytes, file.content_type)}
-    data_payload = {"model": "accounts/fireworks/models/whisper-v3-turbo"}
-    
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            "https://api.fireworks.ai/inference/v1/audio/transcriptions", 
-            files=files_payload, 
-            data=data_payload, 
-            headers=headers
-        )
-        if resp.status_code != 200:
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-        
-        # Bill 100 tokens per estimated minute
-        _deduct_proxy_tokens(user_id, cost, "stt_whisper")
-        
-        return JSONResponse(resp.json())
-
-
-# --- 4. BACKGROUND REMOVAL (RemBG / 0 tokens / Free Forever) ---
-@app.post("/api/v1/images/remove-background")
-async def proxy_remove_background(file: UploadFile = File(...), auth=Depends(verify_gorilla_key)):
-    # Verify key, but we don't bill them for this!
-    file_bytes = await file.read()
-    
-    headers = {}
-    if REMBG_API_KEY:
-        headers["x-api-key"] = REMBG_API_KEY
-        
-    files_payload = {"file": (file.filename, file_bytes, file.content_type)}
-    
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(REMBG_API_URL, files=files_payload, headers=headers)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=resp.status_code, detail=f"RemBG Error: {resp.text}")
-        
-        # Returns the raw PNG image file directly to the frontend
-        return Response(content=resp.content, media_type="image/png")
-
-@app.post("/api/v1/chat/completions/bargain")
-async def proxy_chat_completions_bargain(request: Request, auth=Depends(verify_gorilla_key)):
-    user_id = auth["user_id"]
-    payload = await request.json()
-    
-    # Force the model to OpenRouter's massive 120b model as requested
-    payload["model"] = "deepseek/deepseek-v4-flash:nitro" # Replace with your exact OpenRouter model string
-    
-    # Ask OpenRouter to send usage stats back even if it's a stream
-    if "stream_options" not in payload:
-        payload["stream_options"] = {"include_usage": True}
-        
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": OPENROUTER_SITE_URL,
-        "X-Title": SITE_NAME
-    }
-    
-    # Handle Streaming Responses
-    is_stream = payload.get("stream", False)
-    
-    if is_stream:
-        async def stream_generator():
-            total_tokens = 0
-            async with httpx.AsyncClient() as client:
-                async with client.stream("POST", OPENROUTER_URL, json=payload, headers=headers) as resp:
-                    if resp.status_code != 200:
-                        yield f"data: {json.dumps({'error': 'Upstream provider error'})}\n\n"
-                        return
-                    
-                    async for chunk in resp.aiter_text():
-                        yield chunk
-                        # OpenRouter includes {"usage": {"total_tokens": X}} in the final SSE chunk
-                        if '"usage":' in chunk and '"total_tokens":' in chunk:
-                            try:
-                                # Quick and dirty parse of the usage chunk
-                                parts = chunk.split('"total_tokens":')
-                                if len(parts) > 1:
-                                    token_val = parts[1].split(',')[0].split('}')[0].strip()
-                                    total_tokens = int(token_val)
-                            except: pass
-            
-            # Bill the user after the stream closes (0.5 tokens per 1 API token)
-            if total_tokens > 0:
-                _deduct_proxy_tokens(user_id, total_tokens * 0.3, "chat_stream")
-                
-        return StreamingResponse(stream_generator(), media_type="text/event-stream")
-    
-    # Handle Standard Non-Streaming Responses
-    else:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(OPENROUTER_URL, json=payload, headers=headers)
-            if resp.status_code != 200:
-                raise HTTPException(status_code=resp.status_code, detail=resp.text)
-            
-            data = resp.json()
-            total_tokens = data.get("usage", {}).get("total_tokens", 0)
-            
-            # Bill the user (0.5 tokens per 1 API token)
-            _deduct_proxy_tokens(user_id, total_tokens * 0.3, "chat")
-            
-            return JSONResponse(data)
-
 @app.on_event("startup")
 async def start_background_tasks():
     # Bind the main loop so worker-thread emits can be marshalled safely.
@@ -4737,6 +3187,25 @@ async def _cleanup_expired_otps():
 
 
 # ==========================================================================
+# ROUTER REGISTRATION — split-out route modules (backend/routers/*)
+# These are imported here (near the bottom of the file) rather than at the
+# top, because each router does `import app` and reaches back into this
+# module for shared state (supabase client, DB helpers, templates, token
+# helpers, etc.) at call time. Importing them before those globals/helpers
+# are defined above would leave the routers with missing attributes; doing
+# the import here — after everything they need already exists on this
+# module — avoids a circular-import failure.
+# ==========================================================================
+
+from backend.routers.auth import router as auth_router
+from backend.routers.design import router as design_router
+from backend.routers.gateway import router as gateway_router
+
+app.include_router(auth_router)
+app.include_router(design_router)
+app.include_router(gateway_router)
+
+# ==========================================================================
 # STARTUP WIRING — ORDER MATTERS
 # All of these must be defined ABOVE this block:
 #   - filtered_log_callback (PATCH 1)
@@ -4745,7 +3214,7 @@ async def _cleanup_expired_otps():
 #   - db_upsert, db_delete, db_upsert_batch, db_list_file_paths
 #   - add_monthly_tokens
 # ==========================================================================
- 
+
 lineage_set_log(filtered_log_callback)
 _init_sandbox_manager()
  

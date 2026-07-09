@@ -10,7 +10,7 @@
 <h2>The VybeCoding Illusion</h2>
 <p>Most AI coding tools on the market today are fundamentally crippled: they can only build static frontends. If you ask them for a database or a backend route, they either mock the data using <code>localStorage</code> or instruct you to manually set up a server, manage CORS, and juggle environment variables. They leave you stranded when it comes to actual infrastructure.</p>
 
-<p>Gor://a Builder was engineered to kill backend boilerplate. Every project you create is a true full-stack application, running a headless Node.js environment directly inside the WebContainer alongside your React frontend.</p>
+<p>Gor://a Builder was engineered to kill backend boilerplate. Every project you create is a true full-stack application, running a headless Node.js environment inside your project's sandbox alongside your React frontend.</p>
 
 <h2>The Golden Boilerplate: Backend Architecture</h2>
 <p>When the Gor://a Swarm spins up a new project, it inherently understands our <strong>Golden Boilerplate</strong> backend structure. It uses modern ES Modules (<code>import/export</code>) and Express.js to build your API.</p>
@@ -23,9 +23,9 @@
 │   └── stripe.js         # Webhook handlers
 └── .env                  # Securely injected environment variables</code></pre>
 
-<h2>How the Swarm Writes Backend Code</h2>
+<h2>How the Agent Writes Backend Code</h2>
 <p>Because the AI understands this architecture, it doesn't dump thousands of lines of spaghetti code into a single file. </p>
-<p>When you prompt, <em>"Add an email waitlist,"</em> the <strong>Planner Agent</strong> will instruct the <strong>Coder Agent</strong> to:</p>
+<p>When you prompt, <em>"Add an email waitlist,"</em> the agent plans the change, then works through it step by step:</p>
 <ol>
   <li>Create a new file at <code>routes/waitlist.js</code> to handle the POST request.</li>
   <li>Update <code>server.js</code> to import and mount the new route (<code>app.use('/api/waitlist', waitlistRouter)</code>).</li>
@@ -40,7 +40,7 @@
 </div>
 
 <h2>Seamless Frontend/Backend Communication</h2>
-<p>You never have to worry about CORS (Cross-Origin Resource Sharing) errors. The WebContainer environment uses Vite's proxy capabilities. When your React app makes a <code>fetch('/api/data')</code> request, Vite natively routes it to your running Express server on port 3000. It works locally exactly as it will when you deploy to Vercel.</p>
+<p>You never have to worry about CORS (Cross-Origin Resource Sharing) errors. Your sandbox environment uses Vite's proxy capabilities. When your React app makes a <code>fetch('/api/data')</code> request, Vite natively routes it to your running Express server on port 3000. It works locally exactly as it will when you deploy to Vercel.</p>
 {% endblock %}
 
 {% block footer_nav %}
