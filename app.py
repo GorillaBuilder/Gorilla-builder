@@ -851,11 +851,47 @@ async def project_create_page(request: Request, prompt: Optional[str] = None):
 
 # 2. CREATE ACTION (Backend Insert)
 from backend.figma_import import fetch_and_compress_figma, compile_figma_to_react
-from backend.github_import import fetch_github_repo_files
+from backend.github_import import (
+    fetch_github_repo_files, get_github_login, repo_owner_matches, _parse_github_repo_url,
+)
 import re
 import urllib.parse
 import asyncio
 import os
+
+
+@app.post("/api/github/preview-import")
+async def preview_github_import(request: Request):
+    """
+    Lightweight preview for the dashboard's GitHub-import modal: fetches the
+    repo's file list (no project created yet) and reports whether it belongs
+    to the user's own connected GitHub account, so the frontend can show a
+    "push edits back to this repo" option before the user approves.
+    """
+    user = get_current_user(request)
+    payload = await request.json()
+    repo_url = (payload.get("github_url") or "").strip()
+    if not repo_url:
+        return JSONResponse({"ok": False, "error": "Missing GitHub repo URL."}, status_code=400)
+
+    try:
+        files = await fetch_github_repo_files(repo_url)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+    user_data = db_select_one("users", {"id": user["id"]}, "github_access_token") or {}
+    github_token = user_data.get("github_access_token")
+    login = await get_github_login(github_token) if github_token else None
+    owned_by_user = repo_owner_matches(repo_url, login)
+
+    paths = sorted(files.keys())
+    return JSONResponse({
+        "ok": True,
+        "file_count": len(paths),
+        "paths": paths[:500],
+        "owned_by_user": owned_by_user,
+        "github_connected": bool(github_token),
+    })
 
 @app.post("/projects/create")
 async def create_project(
@@ -870,6 +906,7 @@ async def create_project(
     figma_url: Optional[str] = Form(None),
     use_supabase: Optional[str] = Form(None),
     github_url: Optional[str] = Form(None),
+    github_allow_push: Optional[str] = Form(None),
 ):
     user = get_current_user(request)
 
@@ -961,14 +998,36 @@ async def create_project(
             return RedirectResponse(f"/dashboard?error={urllib.parse.quote(str(e))}", status_code=303)
 
     # --- 3B. GITHUB IMPORT INTERCEPTOR ---
+    final_github_repo_url_to_link = None
     if final_github_url:
         try:
             final_github_files = await fetch_github_repo_files(final_github_url)
-            final_prompt = (
-                "I've imported an existing codebase into this project. Take a look at the "
-                "file structure and give me a brief summary of what this app does and its "
-                "tech stack, then wait for my next instruction — don't make any changes yet."
-            )
+            # Do NOT auto-trigger an agent turn for a repo-only import (no
+            # typed prompt) — the old "summarize the codebase, then wait for
+            # my next instruction" prompt had no clean way to actually stop:
+            # the agent loop only exits cleanly via mark_done, so a model
+            # that just replied with text and no tool call tripped the
+            # no-progress circuit breaker after a few turns. Just seed the
+            # files and land in the editor with the file tree visible —
+            # nothing to fix, nothing to summarize via a burned turn.
+            # If the user DID type their own prompt alongside the repo URL,
+            # leave it untouched — don't discard their actual instructions.
+            if not final_prompt:
+                final_prompt = None
+
+            # Re-verify ownership server-side — never trust the client's
+            # github_allow_push flag on its own, since it decides whether
+            # this project gets permission to push commits back to a real
+            # GitHub repo.
+            if github_allow_push == "true":
+                gh_user_data = db_select_one(
+                    "users", {"id": user["id"]}, "github_access_token"
+                ) or {}
+                gh_token = gh_user_data.get("github_access_token")
+                gh_login = await get_github_login(gh_token) if gh_token else None
+                if repo_owner_matches(final_github_url, gh_login):
+                    owner, repo_name_parsed, _branch = _parse_github_repo_url(final_github_url)
+                    final_github_repo_url_to_link = f"https://github.com/{owner}/{repo_name_parsed}"
         except Exception as e:
             return RedirectResponse(f"/dashboard?error={urllib.parse.quote(str(e))}", status_code=303)
 
@@ -1164,6 +1223,14 @@ async def create_project(
                 db_upsert_batch("files", github_rows, on_conflict="project_id,path")
             except Exception as e:
                 print(f"GitHub import file insert failed: {e}")
+
+            if final_github_repo_url_to_link:
+                try:
+                    supabase.table("projects").update(
+                        {"github_repo_url": final_github_repo_url_to_link}
+                    ).eq("id", pid).execute()
+                except Exception as e:
+                    print(f"GitHub repo link failed: {e}")
 
         return pid
  
@@ -1800,11 +1867,17 @@ async def run_agent_loop(
             think_mode=think_mode,
         )
 
-        # Charge tokens immediately after the turn completes
+        # NOTE: do NOT bill tokens here. _sandbox_manager is constructed with
+        # add_tokens_fn=add_monthly_tokens (see `_sandbox_manager = ...` /
+        # SandboxManager init below) — every turn, reviewer pass, and
+        # spawn_subagent call already bills incrementally in real time
+        # *inside* run_agent_turn as it happens. `result["tokens"]` is just
+        # the cumulative total of everything already billed; charging it
+        # again here double-bills every turn (and compounds further on any
+        # turn that ran a reviewer pass or a sub-agent, since those are
+        # billed incrementally too before being folded into this total).
         total_tokens = result.get("tokens", 0)
         if total_tokens and user_id:
-            # Sync DB writes — keep them off the event loop so SSE never stalls.
-            await asyncio.to_thread(add_monthly_tokens, user_id, total_tokens)
             await asyncio.to_thread(_maybe_emit_token_warning, project_id, user_id)
 
         await asyncio.to_thread(track_event, project_id, "agent_run",
@@ -1850,7 +1923,17 @@ async def run_agent_loop(
             # Re-fetch updated state and continue the loop with an observation
             emit_status(project_id, "Resuming…")
             
-            if action_type == "connect_supabase":
+            denied = bool(resume_data.get("data", {}).get("denied"))
+
+            if action_type == "connect_supabase" and denied:
+                continuation_prompt = (
+                    "The user declined to connect Supabase. Do NOT ask again this "
+                    "session. Continue with the rest of the task using only what's "
+                    "possible without a database — if the feature they asked for "
+                    "strictly requires one, briefly explain that limitation instead "
+                    "of blocking on it."
+                )
+            elif action_type == "connect_supabase":
                 # Reload supabase status and continue
                 user_data_fresh = db_select_one("users", {"id": user_id}, "supabase_access_token") or {}
                 has_supabase_now = bool(user_data_fresh.get("supabase_access_token"))
@@ -1858,6 +1941,13 @@ async def run_agent_loop(
                     "The user has now connected their Supabase account. "
                     f"has_supabase is now {'true' if has_supabase_now else 'still false — they may have cancelled'}. "
                     "Continue with the original task."
+                )
+            elif action_type == "set_env_vars" and denied:
+                continuation_prompt = (
+                    "The user chose to skip providing those environment variables. "
+                    "Do NOT ask again this session. Continue with the rest of the "
+                    "task — if the feature strictly requires those keys, briefly "
+                    "explain that limitation instead of blocking on it."
                 )
             elif action_type == "set_env_vars":
                 submitted = resume_data.get("data", {}).get("vars", {})
@@ -2260,54 +2350,76 @@ async def publish_to_github(request: Request, project_id: str):
         
         res = supabase.table("projects").select("*").eq("id", project_id).single().execute()
         project = res.data
-        
-        # --- UPDATED LOGIC: Make repo name match the Gorilla project name ---
+
+        # If this project is linked to an existing repo (e.g. imported via
+        # "Import a Codebase" with push-back enabled), push straight to THAT
+        # repo instead of creating/finding a new one named after the Gorilla
+        # project — those are two different repos and silently picking the
+        # wrong one would fork the user's history.
+        linked_repo_url = (project.get("github_repo_url") or "").strip()
+        linked_full_name = None
+        if linked_repo_url:
+            m = re.search(r"github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$", linked_repo_url)
+            if m:
+                linked_full_name = f"{m.group(1)}/{m.group(2)}"
+
+        # --- Otherwise: make repo name match the Gorilla project name ---
         raw_name = project.get("name", "gorilla-project")
         # Sanitize to replace spaces and special characters with hyphens (required by GitHub)
         repo_name = re.sub(r'[^a-z0-9-]', '-', raw_name.lower()).strip('-')
-        
+
         # Fallback just in case the name was completely invalid characters
         if not repo_name:
             repo_name = f"gorilla-project-{project_id[:6]}"
-        
+
         files_res = supabase.table("files").select("path,content").eq("project_id", project_id).execute()
         files = getattr(files_res, "data", [])
         if not files and isinstance(files_res, list): files = files_res
 
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.v3+json"}
-        
+
         async with httpx.AsyncClient() as client:
-            # A. Create or Find Repository
-            repo_res = await client.post(
-                "https://api.github.com/user/repos", 
-                json={"name": repo_name, "private": True, "auto_init": True}, 
-                headers=headers
-            )
-            if repo_res.status_code not in [201, 422]:
-                return JSONResponse({"detail": f"GitHub Repo Creation Failed: {repo_res.text}"}, status_code=500)
-            
-            repo_data = repo_res.json()
-            full_name = repo_data.get("full_name")
-            
-            # If repo already exists (422)
-            if repo_res.status_code == 422:
-                user_info_res = await client.get("https://api.github.com/user", headers=headers)
-                if user_info_res.status_code == 200:
-                    login = user_info_res.json().get("login")
-                    full_name = f"{login}/{repo_name}"
-                else:
-                    return JSONResponse({"detail": "Failed to fetch GitHub username for existing repo."}, status_code=500)
-                
-                # SAFETY NET: Check if the existing repo is completely empty!
-                branch_res = await client.get(f"https://api.github.com/repos/{full_name}/branches/main", headers=headers)
-                if branch_res.status_code == 404:
-                    # The repo exists but is empty! Initialize it manually via the Contents API
-                    readme_content = base64.b64encode(b"# Init\n").decode("utf-8")
-                    await client.put(
-                        f"https://api.github.com/repos/{full_name}/contents/README.md",
-                        json={"message": "Initialize empty repository", "content": readme_content},
-                        headers=headers
-                    )
+            if linked_full_name:
+                # B'. Verify the linked repo still exists/is reachable, then
+                # skip straight to pushing — no create-or-find step needed.
+                check_res = await client.get(f"https://api.github.com/repos/{linked_full_name}", headers=headers)
+                if check_res.status_code != 200:
+                    return JSONResponse({
+                        "detail": f"Linked repo {linked_full_name} is no longer reachable: {check_res.text}"
+                    }, status_code=400)
+                full_name = linked_full_name
+            else:
+                # A. Create or Find Repository
+                repo_res = await client.post(
+                    "https://api.github.com/user/repos",
+                    json={"name": repo_name, "private": True, "auto_init": True},
+                    headers=headers
+                )
+                if repo_res.status_code not in [201, 422]:
+                    return JSONResponse({"detail": f"GitHub Repo Creation Failed: {repo_res.text}"}, status_code=500)
+
+                repo_data = repo_res.json()
+                full_name = repo_data.get("full_name")
+
+                # If repo already exists (422)
+                if repo_res.status_code == 422:
+                    user_info_res = await client.get("https://api.github.com/user", headers=headers)
+                    if user_info_res.status_code == 200:
+                        login = user_info_res.json().get("login")
+                        full_name = f"{login}/{repo_name}"
+                    else:
+                        return JSONResponse({"detail": "Failed to fetch GitHub username for existing repo."}, status_code=500)
+
+                    # SAFETY NET: Check if the existing repo is completely empty!
+                    branch_res = await client.get(f"https://api.github.com/repos/{full_name}/branches/main", headers=headers)
+                    if branch_res.status_code == 404:
+                        # The repo exists but is empty! Initialize it manually via the Contents API
+                        readme_content = base64.b64encode(b"# Init\n").decode("utf-8")
+                        await client.put(
+                            f"https://api.github.com/repos/{full_name}/contents/README.md",
+                            json={"message": "Initialize empty repository", "content": readme_content},
+                            headers=headers
+                        )
 
             # B. Bulk Create Blobs & Tree
             tree = []

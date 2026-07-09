@@ -87,7 +87,7 @@ def _parse_response(raw_text: str) -> Dict[str, Any]:
         "message":              "",
         "extra_writes_dropped": 0,
         "user_action":          None,   # ← ADD THIS
-        "spawn_subagent":       None,
+        "spawn_subagents":      [],
     }
 
     if not raw_text:
@@ -164,10 +164,10 @@ def _parse_response(raw_text: str) -> Dict[str, Any]:
                 result["read_calls"].append({"tool": n, "params": p})
 
             elif n == "spawn_subagent":
-                result["spawn_subagent"] = {
+                result["spawn_subagents"].append({
                     "task":      p.get("task", "").strip(),
                     "max_turns": p.get("max_turns", "").strip(),
-                }
+                })
 
             else:
                 log_agent("agent", f"Unknown tool: {n}")

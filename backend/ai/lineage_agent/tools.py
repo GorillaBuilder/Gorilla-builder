@@ -321,8 +321,12 @@ AGENT_TOOL_DEFS = [
             "settings page per this spec'. The sub-agent has its own turn budget "
             "and its own message history (it does not see this conversation); give "
             "it a complete, self-contained task description. It CANNOT spawn "
-            "further sub-agents. Returns a summary of what it did, which files it "
-            "touched, and its final message — not the full sub-conversation."
+            "further sub-agents. You may call this MULTIPLE TIMES in the same "
+            "<tool_call> for independent tasks — they run concurrently, not one "
+            "after another, so batch every independent investigation together "
+            "instead of spawning them one turn at a time. Each returns a summary "
+            "of what it did, which files it touched, and its final message — not "
+            "the full sub-conversation."
         ),
         "parameters": {
             "type": "object",
@@ -394,8 +398,10 @@ def _format_tools_for_prompt() -> str:
         "  - READ TOOLS (read_files, list_dir, grep_search, glob_files, preview_screenshot): unlimited per turn.",
         "  - USER ACTION TOOLS (connect_supabase, set_env_vars): call ALONE, one per turn.",
         "    After calling one, stop — the agent loop pauses until the user responds.",
-        "  - DELEGATION TOOLS (spawn_subagent): call ALONE, one per turn.",
-        "    After calling one, stop — the agent loop pauses until the sub-agent finishes.",
+        "  - DELEGATION TOOLS (spawn_subagent): may call MULTIPLE TIMES in one turn for",
+        "    independent tasks — they run concurrently. Do not mix with write/read/bash",
+        "    tools in the same turn. After calling it, stop — the loop pauses until",
+        "    every spawned sub-agent finishes.",
         f"  - Total functions per <tool_call> capped at {TOTAL_BATCH_LIMIT}.",
         "  - Brief plain-text reasoning is allowed BEFORE <tool_call>, never after.",
         "  - After </tool_call>, stop — results come back next turn.",

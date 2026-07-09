@@ -160,14 +160,13 @@
       color: var(--accent-2);
     }
 
+    /* Slim, always-present progress cue — no text, no spinner (those live in
+       .agent-status-line, right above the input box, where the user is
+       actually looking while the agent works). */
     .status-strip {
-      padding: 8px 14px;
-      border-bottom: 1px solid var(--line);
-      display: flex; align-items: center; justify-content: space-between;
-      flex-shrink: 0;
-      background: var(--bg);
+      height: 2px; flex-shrink: 0; background: var(--line-2); overflow: hidden;
     }
-    .status-left { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .status-strip .prog-bar { height: 100%; width: 0%; background: var(--accent); transition: width 0.4s var(--ease); }
     .dot {
       width: 6px; height: 6px; border-radius: 50%;
       background: var(--warn);
@@ -175,14 +174,23 @@
     }
     .dot.ok { background: var(--ok); box-shadow: 0 0 6px rgba(74,222,128,0.6); }
     .dot.bad { background: var(--danger); box-shadow: 0 0 6px rgba(224,85,85,0.5); }
-    .status-label {
-      font-family: 'DM Sans', sans-serif;
-      font-size: 11.5px; color: var(--muted); font-weight: 500;
-      letter-spacing: -0.005em;
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+
+    /* ── AGENT STATUS LINE (bottom, above input — like Claude Code's CLI) ── */
+    .agent-status-line {
+      display: none; align-items: center; gap: 8px;
+      padding: 6px 14px; font-size: 11.5px;
+      font-family: 'DM Sans', sans-serif; font-weight: 500;
+      color: var(--muted); letter-spacing: -0.005em;
+      border-top: 1px solid var(--line); background: var(--bg);
     }
-    .prog-wrap { width: 70px; height: 2px; background: var(--line-2); border-radius: 1px; overflow: hidden; }
-    .prog-bar { height: 100%; width: 0%; background: var(--accent); transition: width 0.4s var(--ease); }
+    .agent-status-line.active { display: flex; }
+    .agent-status-line .status-label {
+      flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      color: var(--fg);
+    }
+    .agent-status-line .status-elapsed {
+      font-family: 'DM Mono', monospace; font-size: 10.5px; color: var(--dim); flex-shrink: 0;
+    }
 
     /* ── CHAT THREAD ─────────────────────────────────────────────────────── */
     .chat {
@@ -699,13 +707,7 @@
     </div>
   </div>
 
-  <div class="status-strip">
-    <div class="status-left">
-      <span class="ascii-spinner" id="loadingWave">⠋</span>
-      <span class="status-label" id="progressText">Ready</span>
-    </div>
-    <div class="prog-wrap"><div class="prog-bar" id="progressBar"></div></div>
-  </div>
+  <div class="status-strip"><div class="prog-bar" id="progressBar"></div></div>
 
   <div class="chat" id="chat">
     <div class="chat-empty" id="chatEmpty"><pre id="chatEmptyArt"></pre><span>Ask Gor://a to build something</span></div>
@@ -715,6 +717,12 @@
     <button class="sugg-chip" onclick="useSuggestion(this)"><i class="ph ph-check-circle"></i> Verify it works</button>
     <button class="sugg-chip" onclick="useSuggestion(this)"><i class="ph ph-database"></i> Add database</button>
     <button class="sugg-chip" onclick="useSuggestion(this)"><i class="ph ph-device-mobile"></i> Make responsive</button>
+  </div>
+
+  <div class="agent-status-line" id="agentStatusLine">
+    <span class="ascii-spinner active" id="loadingWave">⠋</span>
+    <span class="status-label" id="agentBannerText">Working…</span>
+    <span class="status-elapsed" id="agentElapsed">0s</span>
   </div>
 
   <div class="input-area">
@@ -759,7 +767,8 @@
         GitHub
       </a>
       {% else %}
-      <button class="pill-btn gh" onclick="commitToGithub()" id="btn-github-action">
+      <button class="pill-btn gh" onclick="commitToGithub()" id="btn-github-action"
+        {% if project.github_repo_url %}title="Pushes commits to {{ project.github_repo_url }}"{% else %}title="Creates a new GitHub repo for this project"{% endif %}>
         <i class="ph ph-git-branch"></i>
         {% if project.github_repo_url %}Sync{% else %}Push{% endif %}
       </button>
@@ -1070,7 +1079,10 @@ function _showPreviewWithCheck(url) {
 
 function handleUserInputRequired(m) {
   resetGroup();
-  setInputState(false);
+  // Keep input locked — the agent is paused waiting on THIS card, not free
+  // for a new unrelated message. (setInputState(false) here used to let you
+  // type a new prompt while a connect/env-vars request was still pending,
+  // which raced against the resume flow.)
   if (m.action === "connect_supabase") renderConnectSupabaseCard(m.reason);
   else if (m.action === "set_env_vars") renderEnvVarsCard(m.vars || [], m.reason);
 }
@@ -1083,14 +1095,26 @@ function renderConnectSupabaseCard(reason) {
     <button id="btnConnectSupabase" class="pill-btn blue" style="font-size:12px;">
       <i class="ph ph-database"></i> Connect Supabase
     </button>
+    <button id="btnDenySupabase" class="pill-btn" style="font-size:12px;">
+      <i class="ph ph-x"></i> Not now
+    </button>
     <span id="supabaseConnectStatus" style="margin-left:10px;font-size:12px;color:var(--muted);"></span>`;
   chat.appendChild(el); chat.scrollTop = chat.scrollHeight;
   document.getElementById("btnConnectSupabase").onclick = () => {
     openOAuthPopup("/auth/supabase/link-popup", "supabase_linked", async () => {
       document.getElementById("supabaseConnectStatus").textContent = "Connected! Resuming…";
       document.getElementById("btnConnectSupabase").disabled = true;
+      document.getElementById("btnDenySupabase").disabled = true;
+      setInputState(true);
       await resumeAgent("connect_supabase", {});
     });
+  };
+  document.getElementById("btnDenySupabase").onclick = async () => {
+    document.getElementById("btnConnectSupabase").disabled = true;
+    document.getElementById("btnDenySupabase").disabled = true;
+    document.getElementById("supabaseConnectStatus").textContent = "Declined. Resuming…";
+    setInputState(true);
+    await resumeAgent("connect_supabase", { denied: true });
   };
 }
 
@@ -1111,6 +1135,9 @@ function renderEnvVarsCard(varNames, reason) {
     <button id="btnSubmitEnvVars" class="pill-btn blue" style="font-size:12px;">
       <i class="ph ph-check"></i> Save & Continue
     </button>
+    <button id="btnDenyEnvVars" class="pill-btn" style="font-size:12px;">
+      <i class="ph ph-x"></i> Skip
+    </button>
     <span id="envVarsStatus" style="margin-left:10px;font-size:12px;color:var(--muted);"></span>`;
   chat.appendChild(el); chat.scrollTop = chat.scrollHeight;
   document.getElementById("btnSubmitEnvVars").onclick = async () => {
@@ -1119,10 +1146,18 @@ function renderEnvVarsCard(varNames, reason) {
     inputs.forEach(inp => { const val = inp.value.trim(); if (!val) empty = true; vars[inp.dataset.varname] = val; });
     if (empty) { document.getElementById("envVarsStatus").textContent = "Please fill all fields."; return; }
     document.getElementById("btnSubmitEnvVars").disabled = true;
+    document.getElementById("btnDenyEnvVars").disabled = true;
     document.getElementById("envVarsStatus").textContent = "Saving…";
+    setInputState(true);
     await resumeAgent("set_env_vars", { vars });
     document.getElementById("envVarsStatus").textContent = "Saved! Resuming agent…";
+  };
+  document.getElementById("btnDenyEnvVars").onclick = async () => {
+    document.getElementById("btnSubmitEnvVars").disabled = true;
+    document.getElementById("btnDenyEnvVars").disabled = true;
+    document.getElementById("envVarsStatus").textContent = "Skipped. Resuming…";
     setInputState(true);
+    await resumeAgent("set_env_vars", { denied: true });
   };
 }
 
@@ -1228,9 +1263,14 @@ function addActivityCard(id, verb, target, short) {
   const group = ensureGroup();
   const card = document.createElement('div');
   card.className = 'act running';
+  // Several tools pass the same path/target both inside `short` (e.g.
+  // "Write src/App.tsx") AND as a separate `target` field — only show the
+  // target chip when it adds information `short` doesn't already contain,
+  // otherwise it renders as "Write src/App.tsx  src/App.tsx".
+  const showTarget = target && !(short || '').includes(target);
   card.innerHTML = `
     <i class="ph ${iconFor(verb)} act-icon"></i>
-    <span class="act-label">${short || verb}${target ? `<span class="act-target">${target}</span>` : ''}</span>
+    <span class="act-label">${short || verb}${showTarget ? `<span class="act-target">${target}</span>` : ''}</span>
     <span class="act-status"></span>`;
   const outputWrap = document.createElement('div'); outputWrap.className = 'act-output';
   const inner = document.createElement('div'); inner.className = 'act-output-inner';
@@ -1323,29 +1363,21 @@ function setInputState(locked) {
   if (ed) { ed.style.opacity = locked ? "0.4" : "1"; ed.style.pointerEvents = locked ? "none" : "auto"; }
   setStatusBarConnection(locked ? 'working' : 'ok');
 
-  let banner = $("agentBanner");
+  const statusLine = $("agentStatusLine");
   if (locked) {
     _agentStart = Date.now();
     if (_agentTick) clearInterval(_agentTick);
     _agentTick = setInterval(_tickAgentTimer, 1000);
     if (p) p.placeholder = "Agent is working — send a message to add context";
     if (b) b.innerHTML = '<i class="ph ph-spinner" style="animation:spin 0.9s linear infinite;"></i>';
-    if (!banner) {
-      banner = document.createElement('div');
-      banner.id = "agentBanner";
-      banner.style.cssText = "padding:6px 14px;background:oklch(0.38 0.12 252 / 0.95);border-bottom:1px solid oklch(0.6 0.2 248/0.25);display:flex;align-items:center;gap:10px;flex-shrink:0;";
-      banner.innerHTML = '<span id="agentBannerText" style="font-size:12px;font-weight:500;color:rgba(255,255,255,0.9);flex:1;letter-spacing:-0.005em;">Gorilla is working…</span><span id="agentElapsed" style="font-size:11px;font-family:\'DM Mono\',monospace;color:rgba(255,255,255,0.45);">0s</span>';
-      const chatEl = $("chat");
-      if (chatEl && chatEl.parentNode) chatEl.parentNode.insertBefore(banner, chatEl);
-    }
-    banner.style.display = "flex";
+    if (statusLine) statusLine.classList.add("active");
     showGameFrame();
   } else {
     _agentStart = null;
     if (_agentTick) { clearInterval(_agentTick); _agentTick = null; }
     if (p) p.placeholder = "What shall we build?";
     if (b) b.innerHTML = '<i class="ph-bold ph-arrow-up"></i>';
-    if (banner) banner.style.display = "none";
+    if (statusLine) statusLine.classList.remove("active");
     showPreviewAfterDone();
   }
 }
@@ -1397,14 +1429,14 @@ setInterval(() => {
 }, 80);
 
 function setProgress(text, pct) {
+  const isActive = text && !/Idle|Done|Ready/i.test(text);
   if (text) {
-    $("progressText").textContent = text;
     const bt = $("agentBannerText");
-    if (bt && window.isAgentWorking) bt.textContent = text;
+    if (bt) bt.textContent = text;
   }
   if (pct !== undefined) $("progressBar").style.width = Math.max(0, Math.min(100, Number(pct))) + "%";
-  const wave = $("loadingWave");
-  if (wave) wave.classList.toggle("active", text && !/Idle|Done|Ready/i.test(text));
+  const statusLine = $("agentStatusLine");
+  if (statusLine) statusLine.classList.toggle("active", isActive || window.isAgentWorking);
 }
 function updateSandboxStatus(status) {
   const el = $("sandboxStatus"); if (!el) return;

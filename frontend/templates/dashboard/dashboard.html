@@ -1204,7 +1204,6 @@
 
             <input type="text" id="mainPromptInput" name="prompt" required placeholder="Ask Gor://a to build…" autocomplete="off" autofocus>
             <input type="hidden" id="figmaUrlInput" name="figma_url">
-            <input type="hidden" id="githubUrlInput" name="github_url">
             <input type="hidden" id="thinkModeInput" name="think_mode" value="normal">
 
             <div class="input-actions">
@@ -1418,6 +1417,54 @@
     </div>
   </div>
 
+  <!-- GitHub import: a self-contained two-step flow (enter URL -> preview
+       file structure -> approve). No prompt text is involved anywhere in
+       this modal — importing a codebase is not a chat request, it's a
+       direct action, so it never touches the main prompt bar. -->
+  <div class="confirm-modal-overlay" id="githubImportModal">
+    <div class="confirm-modal" style="width:460px;text-align:left;">
+      <div class="skills-modal-icon"><i class="ph-bold ph-github-logo"></i></div>
+
+      <div id="githubImportStepUrl">
+        <h3 style="text-align:center;">Import from GitHub</h3>
+        <p style="text-align:center;">Paste a public repo URL to start from an existing codebase instead of a blank slate.</p>
+        <input type="text" id="githubImportUrlField" placeholder="https://github.com/owner/repo" autocomplete="off" spellcheck="false"
+          style="width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--line-2);color:var(--fg);
+                 padding:9px 12px;font-size:13px;font-family:'DM Mono',monospace;border-radius:var(--radius-sm);
+                 outline:none;margin-bottom:8px;" />
+        <p id="githubImportError" style="display:none;color:var(--danger,#e05555);text-align:left;margin:0 0 12px;font-size:12px;"></p>
+        <div class="confirm-modal-actions" style="margin-top:12px;">
+          <button class="btn-modal-secondary" onclick="closeGithubImportModal()">Cancel</button>
+          <button class="btn-modal-primary" id="githubImportPreviewBtn">Preview</button>
+        </div>
+      </div>
+
+      <div id="githubImportStepPreview" style="display:none;">
+        <h3 style="text-align:center;">Review before importing</h3>
+        <p style="text-align:center;margin-bottom:10px;" id="githubImportFileCount"></p>
+        <div id="githubImportFileList"
+          style="max-height:220px;overflow-y:auto;background:var(--bg);border:1px solid var(--line-2);
+                 border-radius:var(--radius-sm);padding:8px 10px;margin-bottom:12px;
+                 font-family:'DM Mono',monospace;font-size:11.5px;color:var(--muted);line-height:1.7;"></div>
+        <label id="githubImportPushLabel" style="display:none;align-items:center;gap:8px;margin-bottom:14px;font-size:12.5px;color:var(--fg);cursor:pointer;">
+          <input type="checkbox" id="githubImportPushCheckbox" style="width:15px;height:15px;accent-color:var(--accent);" />
+          This is my repo — allow Gor://a to push edits back to it
+        </label>
+        <div class="confirm-modal-actions">
+          <button class="btn-modal-secondary" id="githubImportBackBtn">Back</button>
+          <button class="btn-modal-primary" id="githubImportApproveBtn">Approve &amp; Import</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Submitted directly (no shared prompt field) once the user approves. -->
+  <form id="githubImportForm" method="post" action="/projects/create" style="display:none;">
+    <input type="hidden" name="github_url" id="githubImportFormUrl">
+    <input type="hidden" name="github_allow_push" id="githubImportFormAllowPush" value="false">
+    <input type="hidden" name="name" id="githubImportFormName">
+  </form>
+
   <script>
     // Mode selection is sent to the server as an explicit `think_mode` field
     // ("fast" | "normal" | "deep") — the server prepends the matching
@@ -1456,17 +1503,14 @@
 
     window.addEventListener('pageshow', () => {
       const figmaHidden    = document.getElementById('figmaUrlInput');
-      const githubHidden   = document.getElementById('githubUrlInput');
       const supabaseHidden = document.getElementById('useSupabaseInput');
       const imgHidden      = document.getElementById('imageBase64');
       const mainPrompt     = document.getElementById('mainPromptInput');
       const fBtn           = document.getElementById('figmaUploadBtn');
-      const gBtn           = document.getElementById('githubImportBtn');
       const sBtn           = document.getElementById('supabaseToggleBtn');
       const sbmBtn         = document.getElementById('submitPromptBtn');
 
       if (figmaHidden)    figmaHidden.value    = '';
-      if (githubHidden)   githubHidden.value   = '';
       if (supabaseHidden) supabaseHidden.value = 'false';
       if (imgHidden)      imgHidden.value      = '';
 
@@ -1478,7 +1522,6 @@
       }
 
       if (mainPrompt) mainPrompt.setAttribute('required', 'required');
-      if (gBtn) gBtn.style.background = '';
 
       if (sbmBtn) {
         sbmBtn.innerHTML = '<i class="ph-bold ph-arrow-up"></i>';
@@ -1531,22 +1574,106 @@
     const mainForm          = document.getElementById('mainPromptForm');
     const submitBtn         = document.getElementById('submitPromptBtn');
     const githubImportBtn   = document.getElementById('githubImportBtn');
-    const githubHiddenInput = document.getElementById('githubUrlInput');
 
-    if (githubImportBtn) {
-      githubImportBtn.addEventListener('click', () => {
-        const url = window.prompt('GitHub repo URL:');
-        if (!url || !url.trim()) return;
-        githubHiddenInput.value = url.trim();
-        githubImportBtn.style.background = 'rgba(10,207,131,0.1)';
-        // A repo import is a valid submission on its own — don't force the
-        // user to also type a prompt.
-        if (promptInput) {
-          promptInput.removeAttribute('required');
-          if (!promptInput.value.trim()) {
-            promptInput.placeholder = 'Repo loaded — add instructions or just hit build…';
-          }
+    const githubImportModal      = document.getElementById('githubImportModal');
+    const githubStepUrl          = document.getElementById('githubImportStepUrl');
+    const githubStepPreview      = document.getElementById('githubImportStepPreview');
+    const githubImportUrlField   = document.getElementById('githubImportUrlField');
+    const githubImportError      = document.getElementById('githubImportError');
+    const githubImportPreviewBtn = document.getElementById('githubImportPreviewBtn');
+    const githubImportBackBtn    = document.getElementById('githubImportBackBtn');
+    const githubImportApproveBtn = document.getElementById('githubImportApproveBtn');
+    const githubImportFileCount  = document.getElementById('githubImportFileCount');
+    const githubImportFileList   = document.getElementById('githubImportFileList');
+    const githubImportPushLabel  = document.getElementById('githubImportPushLabel');
+    const githubImportPushCheckbox = document.getElementById('githubImportPushCheckbox');
+    const githubImportForm       = document.getElementById('githubImportForm');
+    const githubImportFormUrl    = document.getElementById('githubImportFormUrl');
+    const githubImportFormAllowPush = document.getElementById('githubImportFormAllowPush');
+    const githubImportFormName   = document.getElementById('githubImportFormName');
+
+    function showGithubStep(step) {
+      githubStepUrl.style.display     = step === 'url'     ? '' : 'none';
+      githubStepPreview.style.display = step === 'preview' ? '' : 'none';
+    }
+    function openGithubImportModal() {
+      if (!githubImportModal) return;
+      githubImportError.style.display = 'none';
+      showGithubStep('url');
+      githubImportModal.classList.add('active');
+      setTimeout(() => githubImportUrlField.focus(), 50);
+    }
+    function closeGithubImportModal() {
+      if (githubImportModal) githubImportModal.classList.remove('active');
+    }
+    window.closeGithubImportModal = closeGithubImportModal;
+
+    if (githubImportBtn) githubImportBtn.addEventListener('click', openGithubImportModal);
+    if (githubImportModal) {
+      githubImportModal.addEventListener('click', (e) => { if (e.target === githubImportModal) closeGithubImportModal(); });
+    }
+    if (githubImportBackBtn) githubImportBackBtn.addEventListener('click', () => showGithubStep('url'));
+    if (githubImportUrlField) {
+      githubImportUrlField.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); githubImportPreviewBtn.click(); } });
+    }
+
+    // Step 1 -> 2: fetch the repo's file structure and show it for review —
+    // no prompt is ever involved in this flow, it's a direct action.
+    if (githubImportPreviewBtn) {
+      githubImportPreviewBtn.addEventListener('click', async () => {
+        const url = (githubImportUrlField.value || '').trim();
+        githubImportError.style.display = 'none';
+        if (!url) { githubImportError.textContent = 'Enter a GitHub repo URL.'; githubImportError.style.display = 'block'; return; }
+        if (!/^(https?:\/\/)?(www\.)?github\.com\/[^\/\s]+\/[^\/\s]+/i.test(url)) {
+          githubImportError.textContent = 'That doesn\'t look like a GitHub repo URL.';
+          githubImportError.style.display = 'block';
+          return;
         }
+        const orig = githubImportPreviewBtn.innerHTML;
+        githubImportPreviewBtn.innerHTML = '<i class="ph ph-spinner" style="animation:spin 1s linear infinite;"></i>';
+        githubImportPreviewBtn.disabled = true;
+        try {
+          const res = await fetch('/api/github/preview-import', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ github_url: url }),
+          });
+          const data = await res.json();
+          if (!data.ok) throw new Error(data.error || 'Could not load that repo.');
+
+          githubImportFileCount.textContent = `${data.file_count} file${data.file_count === 1 ? '' : 's'} found`;
+          githubImportFileList.innerHTML = data.paths.map(p => `<div>${p}</div>`).join('') || '<em>No files</em>';
+
+          if (data.owned_by_user) {
+            githubImportPushLabel.style.display = 'flex';
+            githubImportPushCheckbox.checked = false;
+          } else {
+            githubImportPushLabel.style.display = 'none';
+            githubImportPushCheckbox.checked = false;
+          }
+
+          githubImportFormUrl.value = url;
+          const repoNameMatch = url.match(/github\.com\/[^\/\s]+\/([^\/\s]+)/i);
+          githubImportFormName.value = repoNameMatch ? repoNameMatch[1].replace(/\.git$/i, '') : 'Imported Project';
+
+          showGithubStep('preview');
+        } catch (err) {
+          githubImportError.textContent = err.message || 'Something went wrong loading that repo.';
+          githubImportError.style.display = 'block';
+        } finally {
+          githubImportPreviewBtn.innerHTML = orig;
+          githubImportPreviewBtn.disabled = false;
+        }
+      });
+    }
+
+    // Step 2: approve -> real form submit (full page navigation), so the
+    // server's redirect straight to the editor works natively.
+    if (githubImportApproveBtn) {
+      githubImportApproveBtn.addEventListener('click', () => {
+        githubImportFormAllowPush.value = githubImportPushCheckbox.checked ? 'true' : 'false';
+        githubImportApproveBtn.disabled = true;
+        githubImportApproveBtn.innerHTML = '<i class="ph ph-spinner" style="animation:spin 1s linear infinite;"></i> Importing…';
+        githubImportForm.submit();
       });
     }
 

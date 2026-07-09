@@ -16,6 +16,7 @@ from .logging_ import log_agent
 from .parsing import _is_safe, _parse_response
 from .prompts import (
     DEBUG_ADDON,
+    DEEP_MODE_ADDON,
     SUPABASE_ADDON,
     SYSTEM_PROMPT_BODY,
     _build_skills_block,
@@ -45,6 +46,7 @@ class LineageAgent:
         # multi-turn tool loops don't drop back to the base model.
         self._deep_think:        bool = False
         self._mode_instruction_injected: bool = False
+        self._deep_addon_in_prompt: bool = False
 
     def _ensure_system_prompt(
         self,
@@ -52,8 +54,14 @@ class LineageAgent:
         has_supabase: bool,
         is_debug: bool,
         agent_skills: Optional[Dict[str, Any]] = None,
+        think_mode: str = "normal",
     ) -> None:
-        if self._system_prompt_set and has_supabase == self._has_supabase:
+        deep_now = think_mode == "deep" or self._deep_think
+        if (
+            self._system_prompt_set
+            and has_supabase == self._has_supabase
+            and deep_now == self._deep_addon_in_prompt
+        ):
             return
 
         prompt = SYSTEM_PROMPT_BODY.replace(
@@ -67,6 +75,10 @@ class LineageAgent:
             prompt += "\n\n**CONTEXT STATE:** `has_supabase` is currently True."
         else:
             prompt += "\n\n**CONTEXT STATE:** `has_supabase` is currently False. (No database is connected)."
+
+        if deep_now:
+            prompt += "\n" + DEEP_MODE_ADDON
+        self._deep_addon_in_prompt = deep_now
 
         if is_debug:
             prompt += "\n" + DEBUG_ADDON
@@ -145,7 +157,7 @@ class LineageAgent:
         if gorilla_proxy_url:
             self._gorilla_proxy_url = gorilla_proxy_url
 
-        self._ensure_system_prompt(gorilla_proxy_url, has_supabase, is_debug, agent_skills)
+        self._ensure_system_prompt(gorilla_proxy_url, has_supabase, is_debug, agent_skills, think_mode)
 
         compressed  = self.token_sub.compress_tree(file_tree)
         clean_paths = sorted(p for p in compressed if not p.endswith(".b64"))
@@ -364,7 +376,7 @@ class LineageAgent:
             "tokens":       self.total_tokens,
             "turn_tokens":  turn_tokens,
             "user_action":  parsed.get("user_action"),   # ← ADD THIS
-            "spawn_subagent": parsed.get("spawn_subagent"),
+            "spawn_subagents": parsed.get("spawn_subagents") or [],
             "_parsed":      parsed,
         }
 

@@ -189,7 +189,11 @@ def classify_command(cmd: str) -> Dict[str, str]:
     if low.startswith("curl"):
         if "supabase.com" in c and "database/query" in c:
             return {"verb": "database", "target": "migration", "short": "Run SQL migration"}
-        return {"verb": "fetch", "target": "", "short": "API call"}
+        if "localhost" in c or "127.0.0.1" in c:
+            return {"verb": "fetch", "target": "", "short": "Checking dev server"}
+        m = re.search(r"curl\s+(?:-\S+\s+)*['\"]?(https?://[^\s'\"]+)", c)
+        url = m.group(1)[:60] if m else ""
+        return {"verb": "fetch", "target": "", "short": f"Fetch {url}" if url else "Run curl command"}
     if low.startswith("cat ") or low.startswith("tail ") or low.startswith("head "):
         m = re.match(r"\S+\s+(?:-\S+\s+)*['\"]?([^\s'\"]+)", c)
         return {"verb": "read", "target": m.group(1) if m else "",
@@ -226,11 +230,12 @@ class SandboxSession:
     _agent_written_paths: Set[str]  = field(default_factory=set,  repr=False)
     _dev_server_up:  bool           = field(default=False,        repr=False)
     _has_ripgrep:    Optional[bool] = field(default=None,         repr=False)
-    # Recursion guard for spawn_subagent: True while a sub-agent run is in
-    # flight for this session, so a nested LineageAgent cannot itself spawn
-    # another sub-agent (hard depth limit of 1, enforced at runtime rather
-    # than by trying to filter the sub-agent's tool list).
-    _in_subagent:    bool           = field(default=False,        repr=False)
+    # How many spawn_subagent runs are currently in flight for this session.
+    # Multiple sub-agents may run concurrently (siblings) — the depth limit
+    # (a sub-agent cannot itself spawn another sub-agent) is enforced inside
+    # _exec_spawn_subagent's own turn loop instead, by simply never
+    # dispatching a nested spawn_subagents request there.
+    _active_subagent_count: int     = field(default=0,            repr=False)
     # Base64 PNG from the most recent preview_screenshot call this turn, if
     # any. Consumed (and cleared) by _do_run_agent_turn after each turn's
     # read calls execute, then threaded into the next agent.run(screenshot_b64=...).
@@ -824,7 +829,7 @@ class E2BSandboxManager:
 
         activity_id = self._next_activity_id(project_id)
         self._emit_activity_start(
-            project_id, activity_id, "screenshot", path, f"Screenshot {path}",
+            project_id, activity_id, "screenshot", path, "Screenshot preview",
         )
 
         url = f"http://localhost:{session.preview_port}{path}"
@@ -1064,19 +1069,12 @@ class E2BSandboxManager:
         Returns (summary_text, turn_tokens_delta) so the caller can bill the
         parent turn for the sub-agent's token usage.
 
-        Depth guard: refuses (no-ops with an error string) if this session is
-        already running a sub-agent — spawn_subagent cannot itself be spawned
-        from inside a sub-agent, enforced here at runtime rather than by
-        trying to filter the nested agent's tool list.
+        Multiple sub-agents may run concurrently as siblings (the caller
+        launches several of these with asyncio.gather). The depth limit — a
+        sub-agent cannot itself spawn another sub-agent — is enforced below,
+        inside this function's own turn loop, by simply never dispatching
+        any spawn_subagents request the sub-agent's own turns produce.
         """
-        if session._in_subagent:
-            return (
-                "spawn_subagent refused: a sub-agent is already running for "
-                "this project. Sub-agents cannot spawn further sub-agents "
-                "(depth limit of 1). Wait for the current one to finish.",
-                0,
-            )
-
         task = (task or "").strip()
         if not task:
             return ("spawn_subagent: no task provided.", 0)
@@ -1093,7 +1091,7 @@ class E2BSandboxManager:
             f"Delegating: {task[:60]}",
         )
 
-        session._in_subagent = True
+        session._active_subagent_count += 1
         sub_agent = LineageAgent(project_id)
         turn_tokens_total = 0
         touched_paths: List[str] = []
@@ -1112,6 +1110,16 @@ class E2BSandboxManager:
 
                 turn_delta = int(result.get("turn_tokens", 0) or 0)
                 turn_tokens_total += turn_delta
+
+                # Depth limit (max 1 level): a sub-agent's own turns are never
+                # dispatched to _exec_spawn_subagent, no matter what it asks for.
+                if result.get("spawn_subagents"):
+                    previous_output = (
+                        "OBSERVATION:\nspawn_subagent is not available inside a "
+                        "sub-agent (depth limit of 1). Do the investigation "
+                        "yourself with read/write/bash tools instead."
+                    )
+                    continue
 
                 write_files = result.get("write_files", [])
                 edit_files  = result.get("edit_files",  [])
@@ -1175,7 +1183,7 @@ class E2BSandboxManager:
             log_agent("agent", f"spawn_subagent error: {e}", project_id)
             final_message = final_message or f"Sub-agent errored: {e}"
         finally:
-            session._in_subagent = False
+            session._active_subagent_count = max(0, session._active_subagent_count - 1)
 
         summary_lines = [f"Sub-agent task: {task}"]
         summary_lines.append(f"Ran {turns_run} turn(s).")
@@ -1300,62 +1308,40 @@ class E2BSandboxManager:
         self._emit_status(project_id, "Session Started..")
         self._emit(project_id, {"type": "sandbox_url", "url": session.url})
 
-        # Pre-warm dev server in background
-        asyncio.create_task(self._prewarm_dev_server(project_id))
+        # NOTE: no auto-boot here anymore. This used to fire-and-forget
+        # `npm install && npm run dev` on every sandbox unconditionally,
+        # which assumed every project is the Node/Vite boilerplate — wrong
+        # for imported non-Node codebases (and wasted an install+boot cycle
+        # even when nothing about the project changed since last session).
+        # Starting the app (whatever stack it actually is) and getting it
+        # reachable on the preview port is now the agent's job, driven by
+        # the system prompt — see prompts.py's Environment section.
 
         return session
 
-    async def _prewarm_dev_server(self, project_id: str) -> None:
-        """
-        Fire-and-forget: install deps + start dev server.
-
-        v18.1 fix: mark _dev_server_up = True as soon as `npm install` finishes
-        (not after the full health check). This lets the restart-blocker engage
-        the moment the install completes, even if the dev server hasn't yet
-        bound its ports. The blocker will redirect any agent restart-attempt
-        to a verify-only command instead of killing and respawning the
-        background process — which was the source of the 6-turn debug loop.
-        """
-        await asyncio.sleep(0.5)
-        session = self._sessions.get(project_id)
-        if not session:
-            return
-        try:
-            # Step 1: install (blocking, may take 60-120s on a cold sandbox)
-            install_cmd = (
-                f"cd {APP_DIR} && "
-                f"(test -d node_modules || "
-                f" npm install --no-audit --no-fund > /tmp/install.log 2>&1)"
-            )
-            await asyncio.to_thread(
-                session.sandbox.commands.run, install_cmd, timeout=240,
-            )
-
-            # Step 2: spawn dev server in fully-detached mode
-            start_cmd = (
-                f"cd {APP_DIR} && "
-                f"(pgrep -f 'npm run dev' > /dev/null || "
-                f" nohup npm run dev > /tmp/dev.log 2>&1 </dev/null & disown)"
-            )
-            await asyncio.to_thread(
-                session.sandbox.commands.run, start_cmd, timeout=10,
-            )
-
-            # ─── BILLING-LOOP FIX: mark up NOW, before ports verified ───
-            # This is the key change. The agent may be on turn 5+ already and
-            # any pkill+restart attempt should be blocked, even if vite is
-            # still warming up on its port.
-            session._dev_server_up = True
-            log_agent("agent", "Pre-warmed dev server in background", project_id)
-        except Exception as e:
-            log_agent("agent", f"Pre-warm skipped: {e}", project_id)
-
     async def _is_dev_process_alive(self, session: SandboxSession) -> bool:
-        """Live check: is there an npm run dev process in the sandbox right now?"""
+        """
+        Live check: is anything actually bound to the dev server ports right
+        now (8080 frontend / 3000 backend)?
+
+        This used to check `pgrep -f 'npm run dev'` for the exact parent
+        process name, but `npm run dev` commonly execs into (or spawns) a
+        `vite`/`node` child that keeps the ports held even after the parent
+        npm process itself has exited — pgrep then reports DOWN, the guard
+        doesn't block the next restart, and the real `npm run dev` collides
+        with the still-listening child (EADDRINUSE), producing a genuine
+        failure the agent has no way to explain except by restarting again.
+        Checking the ports directly is what actually matters, regardless of
+        which process holds them. `/dev/tcp` is a bash builtin — no extra
+        packages required in the sandbox image.
+        """
         try:
             r = await asyncio.to_thread(
                 session.sandbox.commands.run,
-                "pgrep -f 'npm run dev' > /dev/null && echo UP || echo DOWN",
+                "bash -c '"
+                "(echo > /dev/tcp/127.0.0.1/8080) 2>/dev/null && echo UP && exit; "
+                "(echo > /dev/tcp/127.0.0.1/3000) 2>/dev/null && echo UP && exit; "
+                "echo DOWN'",
                 timeout=3,
             )
             return "UP" in (r.stdout or "")
@@ -1666,32 +1652,43 @@ class E2BSandboxManager:
             commands:    List[str]            = result.get("commands", [])
             parsed_internal                   = result.get("_parsed", {})
 
-            # ── Phase 0: spawn_subagent (must run ALONE — enforced by the
-            #    prompt's batching rules, but we handle it defensively even
-            #    if other calls slip in on the same turn) ──────────────────
-            subagent_req = result.get("spawn_subagent")
-            if subagent_req:
-                all_commands.append(f"spawn_subagent:{subagent_req.get('task','')[:80]}")
-                sub_summary, sub_turn_tokens = await self._exec_spawn_subagent(
-                    project_id, session,
-                    subagent_req.get("task", ""),
-                    subagent_req.get("max_turns", ""),
-                )
-                if sub_turn_tokens > 0:
-                    try:
-                        self._add_tokens(session.owner_id, sub_turn_tokens)
-                        self._emit(project_id, {"type": "token_usage", "tokens": sub_turn_tokens})
-                        total_tokens += sub_turn_tokens
-                    except Exception:
-                        pass
+            # ── Phase 0: spawn_subagent — one or more independent delegations
+            #    requested in the same turn run CONCURRENTLY (siblings), not
+            #    serially. Each gets its own fresh LineageAgent + activity card.
+            subagent_reqs = result.get("spawn_subagents") or []
+            if subagent_reqs:
+                for req in subagent_reqs:
+                    all_commands.append(f"spawn_subagent:{req.get('task','')[:80]}")
+                sub_results = await asyncio.gather(*[
+                    self._exec_spawn_subagent(
+                        project_id, session,
+                        req.get("task", ""),
+                        req.get("max_turns", ""),
+                    )
+                    for req in subagent_reqs
+                ])
+                sub_summaries: List[str] = []
+                for i, (sub_summary, sub_turn_tokens) in enumerate(sub_results):
+                    sub_summaries.append(
+                        f"--- Sub-agent {i + 1}/{len(sub_results)} ---\n{sub_summary}"
+                        if len(sub_results) > 1 else sub_summary
+                    )
+                    if sub_turn_tokens > 0:
+                        try:
+                            self._add_tokens(session.owner_id, sub_turn_tokens)
+                            self._emit(project_id, {"type": "token_usage", "tokens": sub_turn_tokens})
+                            total_tokens += sub_turn_tokens
+                        except Exception:
+                            pass
+                combined_summary = "\n\n".join(sub_summaries)
                 if parsed_internal:
                     agent.record_tool_results(
                         parsed_internal,
                         write_observation="",
-                        read_observation=sub_summary,
+                        read_observation=combined_summary,
                         bash_observation="",
                     )
-                previous_output = sub_summary
+                previous_output = combined_summary
                 consecutive_no_action = 0
                 continue
 
@@ -1783,10 +1780,16 @@ class E2BSandboxManager:
                                 session._dev_server_up = True
 
                         if _dev_alive_cached:
+                            # Phrased as a plain observation, not "you are blocked" — the
+                            # agent tends to narrate injected tool output back to the user
+                            # verbatim-ish, and language like "skipping restart" reads as
+                            # the agent being stopped by something rather than just noticing
+                            # the server is already up and moving on.
                             cmd = (
-                                "echo 'DEV_SERVER_RUNNING: process exists on :8080 and :3000. "
-                                "Skipping restart. If ports do not respond, fix the actual code "
-                                "error (check /tmp/dev.log) rather than restarting.'"
+                                "echo 'dev server already running on :8080 and :3000, no "
+                                "restart needed. If a page still is not responding, the "
+                                "issue is a code error, not the process — check /tmp/dev.log "
+                                "for the actual stack trace and fix that.'"
                             )
                             log_agent("agent",
                                 f"Blocked restart dance (process alive): {original[:80]}",
