@@ -178,3 +178,36 @@ async def fetch_github_repo_files(
         raise Exception("No importable text files found in this repo.")
 
     return files
+
+
+async def get_github_login(access_token: str) -> str | None:
+    """Return the GitHub username for a linked account's access token, or
+    None if the token is missing/invalid. Used to check whether an imported
+    repo belongs to the user's own connected GitHub account."""
+    if not access_token:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                "https://api.github.com/user",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Accept": "application/vnd.github.v3+json",
+                },
+            )
+        if resp.status_code == 200:
+            return resp.json().get("login")
+    except Exception:
+        pass
+    return None
+
+
+def repo_owner_matches(repo_url: str, github_login: str | None) -> bool:
+    """True if the given GitHub login owns the repo at repo_url."""
+    if not github_login:
+        return False
+    try:
+        owner, _repo, _branch = _parse_github_repo_url(repo_url)
+    except ValueError:
+        return False
+    return owner.strip().lower() == github_login.strip().lower()
