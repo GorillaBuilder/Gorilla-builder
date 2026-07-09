@@ -1623,6 +1623,9 @@ async def _call_llm(
         "messages":    api_messages,
         "max_tokens":  16000,
         "temperature": temperature,
+        # OpenRouter now always returns usage.cost; flag kept for proxies
+        # (OPENROUTER_URL is overridable) that still gate cost behind it.
+        "usage":       {"include": True},
         "provider": {
             "order":           ["xiaomi", "fireworks", "alibaba", "novita"],
             "allow_fallbacks": False,
@@ -1669,30 +1672,38 @@ async def _call_llm(
     prompt_tokens     = u.get("prompt_tokens",     0)
     completion_tokens = u.get("completion_tokens", 0)
 
-    # ─── BILLING FIX: account for cached input tokens at discounted rate ───
-    # Some providers return `prompt_tokens_details.cached_tokens` indicating
-    # how many prompt tokens hit the prefix cache. Cached tokens are typically
-    # billed at 10% of full rate. If the field is absent, behaviour is
-    # unchanged.
     prompt_details = u.get("prompt_tokens_details") or {}
     cached_tokens  = int(prompt_details.get("cached_tokens", 0) or 0)
-    fresh_prompt_tokens = max(0, prompt_tokens - cached_tokens)
 
-    prompt_price, completion_price = await _fetch_model_price(model)
+    # ─── BILLING: use OpenRouter's actual billed cost (`usage.cost`, USD),
+    # which already reflects prompt-cache discounts, cache writes, and the
+    # exact upstream provider's pricing. Conversion: 1¢ = 10,000 tokens,
+    # i.e. tokens = USD × 1_000_000 — numerically identical to the old µ$
+    # unit, so downstream accounting (turn_tokens / total_tokens) is
+    # unchanged. Falls back to the local token×price estimate only if the
+    # gateway doesn't return `cost` (e.g. a proxy set via OPENROUTER_URL).
+    billed_usd = u.get("cost")
+    if billed_usd is not None:
+        cost_details = u.get("cost_details") or {}
+        billed_usd = float(billed_usd or 0) + float(
+            cost_details.get("upstream_inference_cost") or 0  # BYOK only
+        )
+    else:
+        fresh_prompt_tokens = max(0, prompt_tokens - cached_tokens)
+        prompt_price, completion_price = await _fetch_model_price(model)
+        billed_usd = (
+            fresh_prompt_tokens * prompt_price
+            + cached_tokens     * prompt_price * 0.1
+            + completion_tokens * completion_price
+        )
 
-    # Cached prompt tokens billed at 10% of fresh rate (industry standard)
-    weight_usd = (
-        fresh_prompt_tokens * prompt_price
-        + cached_tokens     * prompt_price * 0.1
-        + completion_tokens * completion_price
-    )
-    weight = int(round(weight_usd * 1_000_000))
+    weight = int(round(billed_usd * 1_000_000))  # 1¢ = 10k tokens
 
     cache_note = f" cached={cached_tokens}" if cached_tokens else ""
     log_agent(
         "agent",
         f"usage p={prompt_tokens}{cache_note} c={completion_tokens} "
-        f"cost={weight}µ$ (${weight / 1_000_000:.6f})",
+        f"billed=${billed_usd:.6f} → {weight} tok (1¢=10k)",
     )
 
     return content, weight
@@ -2051,7 +2062,7 @@ class LineageAgent:
         log_agent(
             "agent",
             f"{'DONE' if done else f'writes={n_writes} edits={n_edits} reads={n_reads} bash={bool(safe_bash)}'} "
-            f"turn={turn_tokens}µ$ total={self.total_tokens}µ$",
+            f"turn={turn_tokens}tok total={self.total_tokens}tok",
             self.project_id,
         )
 
