@@ -28,11 +28,11 @@ from typing import Dict
 # ---------------------------------------------------------------------------
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-MODEL           = os.getenv("LINEAGE_MODEL")
-SMART_MODEL     = os.getenv("SMART_MODEL")
-PLANNER_MODEL   = os.getenv("PLANNER_MODEL")
-VISION_MODEL    = os.getenv("VISION_MODEL")
-DEEP_THINK_MODEL = os.getenv("DEEP_THINK_MODEL")
+MODEL           = os.getenv("LINEAGE_MODEL",     "xiaomi/mimo-v2.5")
+SMART_MODEL     = os.getenv("SMART_MODEL",       "xiaomi/mimo-v2.5-pro")
+PLANNER_MODEL   = os.getenv("PLANNER_MODEL",     "xiaomi/mimo-v2.5-pro")
+VISION_MODEL    = os.getenv("VISION_MODEL",      "xiaomi/mimo-v2.5")
+DEEP_THINK_MODEL = os.getenv("DEEP_THINK_MODEL", "xiaomi/mimo-v2.5-pro")
 
 # ---------------------------------------------------------------------------
 # Think-mode selection
