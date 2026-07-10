@@ -22,7 +22,7 @@ from __future__ import annotations
 import os
 import re
 from typing import Dict
-import dotenv
+from dotenv import load_dotenv
 
 load_dotenv()
 
