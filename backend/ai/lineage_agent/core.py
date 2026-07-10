@@ -301,7 +301,7 @@ class LineageAgent:
 
         log_agent(
             "agent",
-            f"v18.1 model={model.split('/')[-1]} step={len(self.messages) // 2} "
+            f"v18.1 model={model} step={len(self.messages) // 2} "
             f"write_limit={WRITE_BATCH_LIMIT} supabase={has_supabase}",
             self.project_id,
         )
