@@ -31,11 +31,11 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-MODEL           = os.getenv("LINEAGE_MODEL")
-SMART_MODEL     = os.getenv("SMART_MODEL")
-PLANNER_MODEL   = os.getenv("PLANNER_MODEL")
-VISION_MODEL    = os.getenv("VISION_MODEL")
-DEEP_THINK_MODEL = os.getenv("DEEP_THINK_MODEL")
+MODEL="xiaomi/mimo-v2.5"
+SMART_MODE="openai/gpt-5.6-luna-pro"
+PLANNER_MODEL="xiaomi/mimo-v2.5-pro"
+VISION_MODEL="xiaomi/mimo-v2.5"
+DEEP_THINK_MODEL="openai/gpt-5.6-luna-pro"
 
 # ---------------------------------------------------------------------------
 # Think-mode selection
