@@ -100,10 +100,13 @@ async def _call_llm(
         # OpenRouter now always returns usage.cost; flag kept for proxies
         # (OPENROUTER_URL is overridable) that still gate cost behind it.
         "usage":       {"include": True},
-        "provider": {
-            "order":           ["xiaomi", "fireworks", "alibaba", "novita"],
-            "allow_fallbacks": False,
-        },
+        # No hardcoded provider allowlist — that field used to pin routing
+        # to ["xiaomi", "fireworks", "alibaba", "novita"] with
+        # allow_fallbacks=False, tuned for the old xiaomi/mimo models. If
+        # the configured model isn't served by any of those four providers,
+        # OpenRouter has zero eligible endpoints and returns 404 — which is
+        # exactly what broke when the model changed. Let OpenRouter route to
+        # whatever provider actually serves the current model.
     }
 
     if any(x in model.lower() for x in ["mimo", "qwen", "minimax"]):
