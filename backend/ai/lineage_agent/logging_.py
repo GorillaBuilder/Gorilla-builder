@@ -14,21 +14,29 @@ def set_log_callback(cb):
 
 
 def log_agent(role: str, message: str, project_id: str = "") -> None:
+    # role/message are typed as `str` but this is called from 30+ places
+    # across the codebase (and reached the same way `model` was) — a single
+    # falsy value from any one of them shouldn't be able to crash logging
+    # itself, so normalize defensively rather than trust the type hint.
+    role    = role or "agent"
+    message = message if message is not None else ""
+
     prefix = f"[{project_id[:8]}]" if project_id else "[AGENT]"
     ts = time.strftime("%H:%M:%S")
+    role_lower = role.lower()
     c = {
         "agent":    "\033[94m",
         "llm":      "\033[90m",
         "system":   "\033[97m",
         "debugger": "\033[91m",
-    }.get(role.lower(), "\033[94m")
+    }.get(role_lower, "\033[94m")
     print(
         f"\033[90m{ts}\033[0m {prefix} {c}{role.upper()}\033[0m: "
         f"{message[:300]}{'...' if len(message) > 300 else ''}"
     )
-    if _external_log_callback and project_id and role.lower() != "llm":
+    if _external_log_callback and project_id and role_lower != "llm":
         try:
-            _external_log_callback(project_id, role.lower(), message)
+            _external_log_callback(project_id, role_lower, message)
         except Exception:
             pass
 

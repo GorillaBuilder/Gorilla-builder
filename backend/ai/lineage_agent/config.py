@@ -22,20 +22,25 @@ from __future__ import annotations
 import os
 import re
 from typing import Dict
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-MODEL="xiaomi/mimo-v2.5"
-SMART_MODE="openai/gpt-5.6-luna-pro"
-PLANNER_MODEL="xiaomi/mimo-v2.5-pro"
-VISION_MODEL="xiaomi/mimo-v2.5"
-DEEP_THINK_MODEL="openai/gpt-5.6-luna-pro"
+# Hardcoded on purpose — NOT env-driven. Env-var overrides for these were
+# silently dead (load_dotenv() was never actually called anywhere in the
+# app), which meant a deployment could end up with one of these resolving
+# to a bare None if the os.getenv() default was ever dropped, with no
+# environment layer actually catching it. Model routing isn't something an
+# end user configures anyway — hardcoding removes this whole failure class.
+MODEL            = "kwaipilot/kat-coder-pro-v2.5"
+SMART_MODEL      = "kwaipilot/kat-coder-pro-v2.5"
+PLANNER_MODEL    = "kwaipilot/kat-coder-pro-v2.5"
+DEEP_THINK_MODEL = "kwaipilot/kat-coder-pro-v2.5"
+# Left as-is — kat-coder-pro-v2.5 is a coding model, not confirmed vision-
+# capable. Swap this too if you want the same model handling image input.
+VISION_MODEL     = "xiaomi/mimo-v2.5"
 
 # ---------------------------------------------------------------------------
 # Think-mode selection

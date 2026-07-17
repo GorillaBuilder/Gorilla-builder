@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 from .config import (
     DEEP_THINK_MODEL,
     MODE_INSTRUCTIONS,
+    MODEL,
     VISION_MODEL,
     WRITE_BATCH_LIMIT,
     _matches_deep_think_trigger,
@@ -299,6 +300,15 @@ class LineageAgent:
                 is_debug=is_debug,
             )
 
+        if not model:
+            # Defensive: every branch above should always yield a non-empty
+            # string (all backed by env vars with hardcoded defaults), but a
+            # live crash here (model.split on None) took down an entire turn
+            # for no recoverable reason. Fall back rather than crash — a
+            # wrong-but-valid model beats an unhandled exception mid-turn.
+            log_agent("agent", "model resolved to falsy value — falling back to MODEL", self.project_id)
+            model = MODEL
+
         log_agent(
             "agent",
             f"v18.1 model={model} step={len(self.messages) // 2} "
@@ -377,6 +387,7 @@ class LineageAgent:
             "turn_tokens":  turn_tokens,
             "user_action":  parsed.get("user_action"),   # ← ADD THIS
             "spawn_subagents": parsed.get("spawn_subagents") or [],
+            "switch_framework": parsed.get("switch_framework"),
             "_parsed":      parsed,
         }
 

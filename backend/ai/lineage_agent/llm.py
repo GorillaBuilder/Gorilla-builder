@@ -77,6 +77,14 @@ async def _call_llm(
     model:       str   = MODEL,
     temperature: float = 0.6,
 ) -> Tuple[str, int]:
+    # Hard floor: a default parameter value only applies when the argument
+    # is OMITTED — a caller explicitly passing model=None bypasses it
+    # entirely. This was the exact shape of a live crash (model.lower()
+    # below on a None), so guard it here too, not just at the callers.
+    if not model:
+        log_agent("agent", "_call_llm got a falsy model — falling back to MODEL")
+        model = MODEL
+
     messages = _compress_history(messages)
 
     api_messages = []
